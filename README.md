@@ -16,16 +16,50 @@ Egyszeru, tovabbfejlesztheto Spring Boot webalkalmazas, amellyel videot lehet fe
    ```bash
    cd /Users/SEV0A/java/LookupInVideo
    ```
-2. Inditas Maven-nel:
+2. Futtathato script engedelyezese (elso alkalommal):
    ```bash
-   ./mvnw spring-boot:run
+   chmod +x run-videolookup-app.sh run-app.sh
    ```
-   Ha nincs `mvnw`, hasznalhatsz telepitett Mavent:
+3. Inditas scripttel:
    ```bash
-   mvn spring-boot:run
+   ./run-videolookup-app.sh
    ```
-3. Nyisd meg bongeszoben:
+   vagy roviden:
+   ```bash
+   ./run-app.sh
+   ```
+4. Nyisd meg bongeszoben:
    - http://localhost:8080
+
+## Port modositas
+
+Ha masik porton szeretned futtatni:
+
+```bash
+PORT=8090 ./run-app.sh
+```
+
+Ekkor a cim: http://localhost:8090
+
+## Build-only ellenorzes (szerver inditas nelkul)
+
+```bash
+./run-app.sh --build-only
+```
+
+## Alternativ inditas Maven-nel
+
+Ha script nelkul inditanad:
+
+```bash
+./mvnw spring-boot:run
+```
+
+Ha nincs `mvnw`, hasznalhatsz telepitett Mavent:
+
+```bash
+mvn spring-boot:run
+```
 
 ## Tovabbfejlesztesi iranyok
 
