@@ -37,6 +37,10 @@ public class VideoSearchService {
     private static final long DEER_SAMPLE_STEP_US = 250_000L;
     private static final int MAX_MATCHES = 12;
     private static final double DEER_TIMESTAMP_LEAD_SECONDS = 1.1;
+    private static final double DEER_CLUSTER_WINDOW_SECONDS = 2.6;
+    private static final int GLOBAL_SHIFT_MAX_DX = 8;
+    private static final int GLOBAL_SHIFT_MAX_DY = 6;
+    private static final int GLOBAL_SHIFT_SAMPLE_STRIDE = 4;
 
     private final Path storagePath;
     private final Map<String, Path> videoRegistry = new ConcurrentHashMap<>();
@@ -82,7 +86,10 @@ public class VideoSearchService {
             long sampleStepUs = sampleStepForMode(mode);
             Java2DFrameConverter converter = new Java2DFrameConverter();
             BufferedImage previousSample = null;
-            double previousCentroidX = Double.NaN;
+            double previousResidualCentroidX = Double.NaN;
+            double previousResidualCentroidY = Double.NaN;
+            double longitudinalAxisX = 0.0;
+            double longitudinalAxisY = 1.0;
             double motionEma = 0.0;
             long nextSampleUs = 0L;
 
@@ -103,13 +110,36 @@ public class VideoSearchService {
 
                 MotionMetrics motionMetrics = previousSample == null
                         ? MotionMetrics.empty()
-                        : computeMotionMetrics(previousSample, scaled, previousCentroidX);
-                previousCentroidX = motionMetrics.centroidX;
+                    : computeMotionMetrics(
+                    previousSample,
+                    scaled,
+                    previousResidualCentroidX,
+                    previousResidualCentroidY,
+                    longitudinalAxisX,
+                    longitudinalAxisY
+                );
+                previousResidualCentroidX = motionMetrics.centroidX;
+                previousResidualCentroidY = motionMetrics.centroidY;
 
-                double burstScore = Math.max(0.0, motionMetrics.intensity - motionEma);
+                double shiftMagnitude = Math.hypot(motionMetrics.globalShiftX, motionMetrics.globalShiftY);
+                if (shiftMagnitude >= 0.45) {
+                    double shiftUnitX = motionMetrics.globalShiftX / shiftMagnitude;
+                    double shiftUnitY = motionMetrics.globalShiftY / shiftMagnitude;
+                    longitudinalAxisX = longitudinalAxisX * 0.88 + shiftUnitX * 0.12;
+                    longitudinalAxisY = longitudinalAxisY * 0.88 + shiftUnitY * 0.12;
+
+                    double axisMagnitude = Math.hypot(longitudinalAxisX, longitudinalAxisY);
+                    if (axisMagnitude > 1e-6) {
+                    longitudinalAxisX /= axisMagnitude;
+                    longitudinalAxisY /= axisMagnitude;
+                    }
+                }
+
+                double burstBase = mode == QueryMode.DEER ? motionMetrics.residualIntensity : motionMetrics.intensity;
+                double burstScore = Math.max(0.0, burstBase - motionEma);
                 motionEma = motionEma == 0.0
-                        ? motionMetrics.intensity
-                        : (motionEma * 0.85 + motionMetrics.intensity * 0.15);
+                    ? burstBase
+                    : (motionEma * 0.85 + burstBase * 0.15);
                 previousSample = scaled;
 
                 double score;
@@ -122,9 +152,10 @@ public class VideoSearchService {
                     score = computeDeerScore(motionMetrics, burstScore);
                     reason = String.format(
                             Locale.ROOT,
-                            "Szarvas-heurisztika: %.1f%% | Mozgas: %.1f%% | Kozepso sav: %.1f%%",
+                            "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%%",
                             score * 100,
-                            motionMetrics.intensity * 100,
+                            motionMetrics.crossMotionRatio * 100,
+                            motionMetrics.residualIntensity * 100,
                             motionMetrics.centerRatio * 100
                     );
                 } else {
@@ -172,7 +203,7 @@ public class VideoSearchService {
                 note = "A kereses most a piros szin dominanciajara optimalizalt, jo alap a tovabbi boviteshez.";
             } else if (mode == QueryMode.DEER) {
                 modeLabel = "Szarvas keresese keresztmozgas alapjan";
-                note = "A szarvas/deer kulcsszavaknal surubb mintavetellel, kozepso-sav hangsullyal es mozgas-kitorest figyelo heurisztikaval pontozunk.";
+                note = "A szarvas/deer kulcsszavaknal hattermozgast kompenzalunk, majd a keresztiranyu lokalis mozgast pontozzuk (ugyanazzal a logikaval jobbrol-balra es balrol-jobbra esetben is).";
             } else {
                 modeLabel = "Demo: mozgasalapu jelenet-kereses";
                 note = "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
@@ -201,7 +232,7 @@ public class VideoSearchService {
     private static boolean isMatch(QueryMode mode, double score) {
         return switch (mode) {
             case RED -> score >= 0.12;
-            case DEER -> score >= 0.08;
+            case DEER -> score >= 0.09;
             case MOTION -> score >= 0.18;
         };
     }
@@ -211,16 +242,21 @@ public class VideoSearchService {
             return candidates;
         }
 
-        candidates.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
-        double topScore = candidates.get(0).getConfidence();
-        double dynamicThreshold = Math.max(0.08, topScore * 0.65);
+        List<SceneMatch> byTime = new ArrayList<>(candidates);
+        byTime.sort(Comparator.comparingDouble(SceneMatch::getTimestampSeconds));
+
+        List<SceneMatch> representatives = selectTemporalRepresentatives(byTime, DEER_CLUSTER_WINDOW_SECONDS);
+        representatives.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
+
+        double topScore = representatives.get(0).getConfidence();
+        double dynamicThreshold = clamp(topScore * 0.50, 0.09, 0.29);
 
         List<SceneMatch> filtered = new ArrayList<>();
-        for (SceneMatch candidate : candidates) {
-            if (candidate.getConfidence() < dynamicThreshold) {
+        for (SceneMatch candidate : representatives) {
+            if (candidate.getConfidence() < dynamicThreshold && filtered.size() >= 3) {
                 continue;
             }
-            if (isTooCloseInTime(filtered, candidate, 0.8)) {
+            if (isTooCloseInTime(filtered, candidate, 0.95)) {
                 continue;
             }
             filtered.add(candidate);
@@ -230,9 +266,53 @@ public class VideoSearchService {
         }
 
         if (filtered.isEmpty()) {
-            filtered.add(candidates.get(0));
+            filtered.add(representatives.get(0));
         }
         return filtered;
+    }
+
+    private static List<SceneMatch> selectTemporalRepresentatives(List<SceneMatch> byTime, double clusterWindowSeconds) {
+        List<SceneMatch> representatives = new ArrayList<>();
+
+        SceneMatch earliestInCluster = null;
+        SceneMatch strongestInCluster = null;
+        double clusterStart = 0.0;
+
+        for (SceneMatch candidate : byTime) {
+            if (strongestInCluster == null) {
+                earliestInCluster = candidate;
+                strongestInCluster = candidate;
+                clusterStart = candidate.getTimestampSeconds();
+                continue;
+            }
+
+            if (candidate.getTimestampSeconds() - clusterStart <= clusterWindowSeconds) {
+                if (candidate.getConfidence() > strongestInCluster.getConfidence()) {
+                    strongestInCluster = candidate;
+                }
+                continue;
+            }
+
+            representatives.add(mergeClusterMatch(strongestInCluster, earliestInCluster));
+            earliestInCluster = candidate;
+            strongestInCluster = candidate;
+            clusterStart = candidate.getTimestampSeconds();
+        }
+
+        if (strongestInCluster != null && earliestInCluster != null) {
+            representatives.add(mergeClusterMatch(strongestInCluster, earliestInCluster));
+        }
+
+        return representatives;
+    }
+
+    private static SceneMatch mergeClusterMatch(SceneMatch strongest, SceneMatch earliest) {
+        return new SceneMatch(
+                earliest.getTimestampSeconds(),
+                strongest.getConfidence(),
+                strongest.getReason(),
+                strongest.getPreviewDataUrl()
+        );
     }
 
     private static boolean isTooCloseInTime(List<SceneMatch> selected, SceneMatch candidate, double minGapSeconds) {
@@ -245,17 +325,22 @@ public class VideoSearchService {
     }
 
     private static double computeDeerScore(MotionMetrics motion, double burstScore) {
-        // Prefer local crossing-like movement over broad scene changes.
         double compactness = motion.activeRatio <= 0.0001
                 ? 0.0
-                : clamp((motion.intensity / motion.activeRatio) / 4.0, 0.0, 1.0);
+            : clamp((motion.residualIntensity / motion.activeRatio) / 3.7, 0.0, 1.0);
+        double foregroundIsolation = 1.0 - clamp(motion.activeRatio / 0.14, 0.0, 1.0);
+        double residualGate = clamp((motion.residualIntensity - 0.010) / 0.070, 0.0, 1.0);
+        double directionalConfidence = clamp(motion.crossMotionRatio * motion.travelScore * residualGate, 0.0, 1.0);
+        double laneCenterFocus = 1.0 - clamp(Math.abs(motion.centroidX - 0.5) / 0.5, 0.0, 1.0);
 
         double combined =
-                motion.intensity * 1.8 +
-                motion.centerRatio * 0.35 +
-                motion.lateralShift * 1.2 +
-                burstScore * 2.5 +
-                compactness * 0.18;
+            directionalConfidence * 0.40 +
+            motion.residualIntensity * 0.22 +
+            motion.centerRatio * 0.11 +
+            burstScore * 0.10 +
+            foregroundIsolation * 0.06 +
+            compactness * 0.07 +
+            laneCenterFocus * 0.04;
 
         return clamp(combined, 0.0, 1.0);
     }
@@ -324,64 +409,190 @@ public class VideoSearchService {
 
     private static MotionMetrics computeMotionMetrics(BufferedImage previous,
                                                       BufferedImage current,
-                                                      double previousCentroidX) {
+                                                      double previousCentroidX,
+                                                      double previousCentroidY,
+                                                      double longitudinalAxisX,
+                                                      double longitudinalAxisY) {
         int width = Math.min(previous.getWidth(), current.getWidth());
         int height = Math.min(previous.getHeight(), current.getHeight());
 
-        double sum = 0.0;
-        int samples = 0;
+        GlobalShift shift = estimateGlobalShift(previous, current, width, height);
+
+        double rawSum = 0.0;
+        int rawSamples = 0;
+
+        double residualSum = 0.0;
+        int residualSamples = 0;
+
+        int roiSamples = 0;
         int active = 0;
 
         double motionWeight = 0.0;
         double weightedX = 0.0;
+        double weightedY = 0.0;
         double centerWeight = 0.0;
 
-        int centerStart = (int) Math.round(width * 0.28);
-        int centerEnd = (int) Math.round(width * 0.72);
+        int roiStartX = (int) Math.round(width * 0.10);
+        int roiEndX = (int) Math.round(width * 0.90);
+        int roiStartY = (int) Math.round(height * 0.22);
+        int roiEndY = (int) Math.round(height * 0.95);
+
+        int centerStartX = (int) Math.round(width * 0.26);
+        int centerEndX = (int) Math.round(width * 0.74);
+        int centerStartY = (int) Math.round(height * 0.25);
+        int centerEndY = (int) Math.round(height * 0.90);
 
         for (int y = 0; y < height; y += 2) {
             for (int x = 0; x < width; x += 2) {
                 int rgbA = previous.getRGB(x, y);
-                int rgbB = current.getRGB(x, y);
+                int rgbRaw = current.getRGB(x, y);
+
+                int rawDiffR = Math.abs(((rgbA >> 16) & 0xFF) - ((rgbRaw >> 16) & 0xFF));
+                int rawDiffG = Math.abs(((rgbA >> 8) & 0xFF) - ((rgbRaw >> 8) & 0xFF));
+                int rawDiffB = Math.abs((rgbA & 0xFF) - (rgbRaw & 0xFF));
+                rawSum += (rawDiffR + rawDiffG + rawDiffB) / 765.0;
+                rawSamples++;
+
+                int shiftedX = x + shift.dx;
+                int shiftedY = y + shift.dy;
+                if (shiftedX < 0 || shiftedX >= width || shiftedY < 0 || shiftedY >= height) {
+                    continue;
+                }
+
+                int rgbB = current.getRGB(shiftedX, shiftedY);
 
                 int rDiff = Math.abs(((rgbA >> 16) & 0xFF) - ((rgbB >> 16) & 0xFF));
                 int gDiff = Math.abs(((rgbA >> 8) & 0xFF) - ((rgbB >> 8) & 0xFF));
                 int bDiff = Math.abs((rgbA & 0xFF) - (rgbB & 0xFF));
 
                 double diff = (rDiff + gDiff + bDiff) / 765.0;
-                sum += diff;
-                samples++;
+                residualSum += diff;
+                residualSamples++;
 
-                if (diff >= 0.16) {
+                boolean inRoi = x >= roiStartX && x <= roiEndX && y >= roiStartY && y <= roiEndY;
+                if (!inRoi) {
+                    continue;
+                }
+
+                roiSamples++;
+
+                if (diff >= 0.11) {
                     active++;
                     motionWeight += diff;
                     weightedX += x * diff;
-                    if (x >= centerStart && x <= centerEnd) {
+                    weightedY += y * diff;
+                    if (x >= centerStartX && x <= centerEndX && y >= centerStartY && y <= centerEndY) {
                         centerWeight += diff;
                     }
                 }
             }
         }
 
-        if (samples == 0) {
+        if (rawSamples == 0) {
             return MotionMetrics.empty();
         }
 
-        double intensity = sum / samples;
-        double activeRatio = active / (double) samples;
+        double intensity = rawSum / rawSamples;
+        double residualIntensity = residualSamples == 0 ? 0.0 : residualSum / residualSamples;
+        double activeRatio = active / (double) Math.max(1, roiSamples);
 
         double centroidX;
+        double centroidY;
         if (motionWeight <= 0.0) {
             centroidX = Double.isNaN(previousCentroidX) ? 0.5 : previousCentroidX;
+            centroidY = Double.isNaN(previousCentroidY) ? 0.68 : previousCentroidY;
         } else {
             centroidX = (weightedX / motionWeight) / Math.max(1.0, (double) (width - 1));
+            centroidY = (weightedY / motionWeight) / Math.max(1.0, (double) (height - 1));
         }
         centroidX = clamp(centroidX, 0.0, 1.0);
+        centroidY = clamp(centroidY, 0.0, 1.0);
 
         double centerRatio = motionWeight <= 0.0 ? 0.0 : centerWeight / motionWeight;
-        double lateralShift = Double.isNaN(previousCentroidX) ? 0.0 : Math.abs(centroidX - previousCentroidX);
+        double objectShiftX = Double.isNaN(previousCentroidX) ? 0.0 : centroidX - previousCentroidX;
+        double objectShiftY = Double.isNaN(previousCentroidY) ? 0.0 : centroidY - previousCentroidY;
+        double objectSpeed = Math.hypot(objectShiftX, objectShiftY);
 
-        return new MotionMetrics(intensity, activeRatio, centerRatio, centroidX, lateralShift);
+        double axisNorm = Math.hypot(longitudinalAxisX, longitudinalAxisY);
+        double axisX = axisNorm < 1e-6 ? 0.0 : longitudinalAxisX / axisNorm;
+        double axisY = axisNorm < 1e-6 ? 1.0 : longitudinalAxisY / axisNorm;
+
+        double crossMotionRatio = 0.0;
+        if (!Double.isNaN(previousCentroidX) && !Double.isNaN(previousCentroidY) && objectSpeed > 1e-6) {
+            double parallel = Math.abs(objectShiftX * axisX + objectShiftY * axisY);
+            double cross = Math.abs(objectShiftX * (-axisY) + objectShiftY * axisX);
+            crossMotionRatio = cross / (cross + parallel + 1e-6);
+        }
+
+        double travelScore = clamp(objectSpeed * 7.0, 0.0, 1.0);
+
+        return new MotionMetrics(
+                intensity,
+                residualIntensity,
+                activeRatio,
+                centerRatio,
+                centroidX,
+                centroidY,
+                crossMotionRatio,
+                travelScore,
+                shift.dx,
+                shift.dy
+        );
+    }
+
+    private static GlobalShift estimateGlobalShift(BufferedImage previous,
+                                                   BufferedImage current,
+                                                   int width,
+                                                   int height) {
+        int bestDx = 0;
+        int bestDy = 0;
+        double bestError = Double.MAX_VALUE;
+
+        for (int dy = -GLOBAL_SHIFT_MAX_DY; dy <= GLOBAL_SHIFT_MAX_DY; dy++) {
+            for (int dx = -GLOBAL_SHIFT_MAX_DX; dx <= GLOBAL_SHIFT_MAX_DX; dx++) {
+                int startX = Math.max(0, -dx);
+                int endX = Math.min(width, width - dx);
+                int startY = Math.max(0, -dy);
+                int endY = Math.min(height, height - dy);
+
+                if (endX - startX < 24 || endY - startY < 16) {
+                    continue;
+                }
+
+                double errorSum = 0.0;
+                int samples = 0;
+                for (int y = startY; y < endY; y += GLOBAL_SHIFT_SAMPLE_STRIDE) {
+                    for (int x = startX; x < endX; x += GLOBAL_SHIFT_SAMPLE_STRIDE) {
+                        int lumaPrev = luma(previous.getRGB(x, y));
+                        int lumaCurr = luma(current.getRGB(x + dx, y + dy));
+                        errorSum += Math.abs(lumaPrev - lumaCurr);
+                        samples++;
+                    }
+                }
+
+                if (samples == 0) {
+                    continue;
+                }
+
+                double error = errorSum / samples;
+                error += Math.hypot(dx, dy) * 0.15;
+
+                if (error < bestError) {
+                    bestError = error;
+                    bestDx = dx;
+                    bestDy = dy;
+                }
+            }
+        }
+
+        return new GlobalShift(bestDx, bestDy);
+    }
+
+    private static int luma(int rgb) {
+        int r = (rgb >> 16) & 0xFF;
+        int g = (rgb >> 8) & 0xFF;
+        int b = rgb & 0xFF;
+        return (r * 299 + g * 587 + b * 114) / 1000;
     }
 
     private enum QueryMode {
@@ -392,25 +603,50 @@ public class VideoSearchService {
 
     private static final class MotionMetrics {
         private final double intensity;
+        private final double residualIntensity;
         private final double activeRatio;
         private final double centerRatio;
         private final double centroidX;
-        private final double lateralShift;
+        private final double centroidY;
+        private final double crossMotionRatio;
+        private final double travelScore;
+        private final double globalShiftX;
+        private final double globalShiftY;
 
         private MotionMetrics(double intensity,
+                              double residualIntensity,
                               double activeRatio,
                               double centerRatio,
                               double centroidX,
-                              double lateralShift) {
+                              double centroidY,
+                              double crossMotionRatio,
+                              double travelScore,
+                              double globalShiftX,
+                              double globalShiftY) {
             this.intensity = intensity;
+            this.residualIntensity = residualIntensity;
             this.activeRatio = activeRatio;
             this.centerRatio = centerRatio;
             this.centroidX = centroidX;
-            this.lateralShift = lateralShift;
+            this.centroidY = centroidY;
+            this.crossMotionRatio = crossMotionRatio;
+            this.travelScore = travelScore;
+            this.globalShiftX = globalShiftX;
+            this.globalShiftY = globalShiftY;
         }
 
         private static MotionMetrics empty() {
-            return new MotionMetrics(0.0, 0.0, 0.0, 0.5, 0.0);
+            return new MotionMetrics(0.0, 0.0, 0.0, 0.0, 0.5, 0.68, 0.0, 0.0, 0.0, 0.0);
+        }
+    }
+
+    private static final class GlobalShift {
+        private final int dx;
+        private final int dy;
+
+        private GlobalShift(int dx, int dy) {
+            this.dx = dx;
+            this.dy = dy;
         }
     }
 
