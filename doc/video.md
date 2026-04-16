@@ -59,49 +59,141 @@ Ha csak forditani szeretnel futas nelkul:
    - az egyes talalatokra ugrasi gomb.
 8. Ugraskor a lejatszo currentTime erteke a talalat masodpercere all, es indul a lejatszas.
 
-## 5. Keresesi logika - pontosan mit csinal?
+## 5. Keresesi logika - pontos algoritmus
 
-A szolgaltatas minden mintaponton pontozza a kepkockat, majd kuszob alapjan dont, hogy talalat-e.
+Ez a fejezet a jelenlegi implementaciot irja le 1:1-ben, kulon kiemelve a keresztiranyu (deer/szarvas) mozgast.
 
-### 5.1 Mintavetelezes
-- A feldolgozas frame-alapon halad, es idobelyeg szerint mintaz.
-- Alapertelmezett mintavetel: 1 masodperc (DEFAULT_SAMPLE_STEP_US = 1_000_000 mikrosec).
-- Szarvas/deer modban surubb mintavetel fut: 0.25 masodperc (DEER_SAMPLE_STEP_US = 250_000 mikrosec).
-- Minden mintaponton a frame le van skalazva max 320 px szelessegre.
-- A pixelekbol ritkitott mintat vesz (x es y iranyban 2 pixelenkent), hogy gyorsabb legyen.
+### 5.1 Elokeszites es mintavetelezes
+- A query normalizalasa: kisbetusites + ekezetek eltavolitasa.
+- Uzemmod valasztas:
+  - RED: ha query tartalmazza a "piros" vagy "red" szot.
+  - DEER: ha query tartalmazza a "szarvas" vagy "deer" szot.
+  - MOTION: minden mas eset.
+- Mintaveteli lepeskuzob idoben:
+  - DEFAULT_SAMPLE_STEP_US = 1_000_000 us (1.0 s)
+  - DEER_SAMPLE_STEP_US = 250_000 us (0.25 s)
+- Minden vizsgalt frame max 320 px szelesre van skalazva.
+- Pixelbejras ritkitva: x,y tengelyen 2 pixelenkent.
 
-### 5.2 Harom uzemmod
-A query normalizalasa utan (kisbetusites + ekezetek elhagyasa) a rendszer eldonti az uzemmodot:
+### 5.2 Mozgasmetrikak (DEER mod alapja)
 
-1. Piros mod:
-   - Aktiv, ha a query tartalmazza a "piros" vagy "red" szot.
-   - Szamol egy redScore-t: a red-dominans pixelek aranyat.
-   - Pixel red-dominans, ha:
-     - r > 90
-     - r > g * 1.25
-     - r > b * 1.25
-   - Talalat, ha redScore >= 0.12.
+#### 5.2.1 Globalis kameraelmozdulas becslese
+A cel: szetvalasztani a "kamera megy elore" jellegu hossziranyu hattermozgast attol, ami lokalis keresztmozgast okoz (pl. szarvas).
 
-2. Szarvas/deer mod:
-  - Aktiv, ha a query tartalmazza a "szarvas" vagy "deer" szot.
-  - Surubb mintavetellel dolgozik (0.25 mp), hogy a rovid, keresztiranyu mozgast is elkapja.
-  - A score tobb jel osszege:
-    - mozgas-intenzitas,
-    - kozepso savban koncentralt mozgas,
-    - oldaliroanyu centroid-elmozdulas,
-    - hirtelen mozgas-kitores (burst),
-    - lokalizalt (kompakt) mozgas.
-  - A talalati idopontot 1.1 mp-cel visszahuzzuk, mert a mozgas-csucs tipikusan kesobb jon, mint amikor az allat belep a kepbe.
+- A rendszer dx,dy eltolast keres az elozo es aktualis frame kozott:
+  - dx tartomany: [-8, 8]
+  - dy tartomany: [-6, 6]
+  - minta stride: 4 pixel
+- Minden jelolt eltolasra luma-alapu atlagos abszolut hibaatlagot szamol.
+- Luma: (299*R + 587*G + 114*B) / 1000.
+- Regularizacio: error += 0.15 * sqrt(dx^2 + dy^2), hogy ne valasszon indokolatlanul nagy eltolast.
+- A legkisebb hibaju dx,dy lesz a globalShift.
 
-3. Mozgas mod (demo alapertelmezett):
-  - Minden mas query ide esik.
-  - Szamol egy motionScore-t az elozo es aktualis minta kep kulonbsegebol.
-  - Talalat, ha motionScore >= 0.18.
+#### 5.2.2 Nyers es kompenzalt mozgaskep
+- intensity (nyers): elozo vs aktualis pixelkulonbseg atlag, kompenzacio nelkul.
+- residualIntensity (kompenzalt): elozo vs eltolt aktualis frame kulonbseg atlag.
+  - Ez mar jobban mutatja a lokalis objektummozgast, mert a hattermozgas egy reszet kivonjuk.
 
-### 5.3 Talalatok rendezese
-- Eloszor confidence szerint csokkeno sorba rendez.
-- Legfeljebb 12 talalatot tart meg.
-- Vegul idobelyeg szerint novekvo sorrendben jeleniti meg.
+#### 5.2.3 Aktiv mozgaspixelek es ROI
+- ROI (ahol aktiv mozgast szamolunk):
+  - x: 10% - 90%
+  - y: 22% - 95%
+- Aktiv pixel feltetel: residual diff >= 0.11.
+- activeRatio = aktivPixelek / roiPixelek.
+- Mozgas-sulypont (centroid) diff-sulyozottan szamolva:
+  - centroidX, centroidY normalizalt [0,1] tartomanyban.
+- centerRatio: az aktiv mozgas sulyanak mekkora resze esik a kozepso regioba:
+  - center x: 26% - 74%
+  - center y: 25% - 90%
+
+#### 5.2.4 Hossztengely tanulasa es keresztiranyu arany
+- A rendszer fenntart egy becsult longitudinalAxis vektort (hossziranyu kamera-folyas).
+- Frissites akkor tortenik, ha |globalShift| >= 0.45.
+- Sima frissites:
+  - axis = axis*0.88 + shiftUnit*0.12
+  - majd normalizalas.
+- Objektumelmozdulas a residual centroidokbol:
+  - objectShift = currentCentroid - previousCentroid
+  - objectSpeed = |objectShift|
+- Szetszedes parhuzamos + kereszt komponensre:
+  - parallel = |dot(objectShift, axis)|
+  - cross = |dot(objectShift, axis_perp)|
+  - crossMotionRatio = cross / (cross + parallel + 1e-6)
+- travelScore = clamp(objectSpeed * 7.0, 0, 1).
+
+#### 5.2.5 Burst (mozgas-kitores)
+- motionEma exponencialis atlag:
+  - ema = ema*0.85 + burstBase*0.15
+- DEER modban burstBase = residualIntensity.
+- burstScore = max(0, burstBase - motionEma).
+
+### 5.3 Deer Score (pontosan)
+
+#### 5.3.1 Reszkomponensek
+- compactness = clamp((residualIntensity / activeRatio) / 3.7, 0, 1), ha activeRatio nagyon kicsi, akkor 0.
+- foregroundIsolation = 1 - clamp(activeRatio / 0.14, 0, 1).
+- residualGate = clamp((residualIntensity - 0.010) / 0.070, 0, 1).
+- directionalConfidence = clamp(crossMotionRatio * travelScore * residualGate, 0, 1).
+- laneCenterFocus = 1 - clamp(|centroidX - 0.5| / 0.5, 0, 1).
+
+#### 5.3.2 Vegso keplet
+deerScore = clamp(
+  directionalConfidence * 0.40 +
+  residualIntensity * 0.22 +
+  centerRatio * 0.11 +
+  burstScore * 0.10 +
+  foregroundIsolation * 0.06 +
+  compactness * 0.07 +
+  laneCenterFocus * 0.04,
+  0, 1
+)
+
+#### 5.3.3 Elso szintu talalati kuszob
+- DEER modban egy frame-jelolt talalat, ha deerScore >= 0.09.
+- A nyers idopontbol 1.1 mp visszahuzas tortenik:
+  - timestamp = max(0, timestamp - 1.1)
+  - Ez a belepes kozeli idopontot adja vissza, nem a kesobbi score-csucsot.
+
+### 5.4 Deer utoszures (miert talalja meg mindket iranyt)
+
+Ez a blokk azert van, hogy a rovid keresztmozgast ne nyomjak el kesobbi, eros csucsok.
+
+- 1) Jeloltek idorendbe rendezese.
+- 2) Temporalis klaszterezes 2.6 mp ablakkal (DEER_CLUSTER_WINDOW_SECONDS):
+  - Minden klaszterbol egy reprezentans marad.
+  - A reprezentans confidence-e a klaszter legerosebb pontja.
+  - A reprezentans idopontja a klaszter legkorabbi pontja.
+  - Ez segit, hogy a crossing eleje maradjon meg.
+- 3) Reprezentansok confidence szerint rendezve, dinamikus kuszob:
+  - dynamicThreshold = clamp(topScore * 0.50, 0.09, 0.29)
+- 4) Kivalasztas:
+  - az elso 3 eros jeloltet akkor is megtartja, ha kuszob alatt van,
+  - utana kuszob alattiakat eldobja,
+  - 0.95 mp-en belul tul kozelieket osszevon.
+- 5) Max talalatszam: 12.
+- 6) Vegso kimenet idorendben.
+
+### 5.5 Masik ket mod roviden
+
+#### 5.5.1 RED mod
+- redScore = red-dominans pixelek aranya.
+- Pixel red-dominans, ha:
+  - R > 90
+  - R > G * 1.25
+  - R > B * 1.25
+- Talalat, ha redScore >= 0.12.
+
+#### 5.5.2 MOTION mod
+- Score = intensity (nyers framekulonbseg-atlag).
+- Talalat, ha score >= 0.18.
+
+### 5.6 Mit jelent ez a gyakorlatban szarvasnal?
+- A kamera hossziranyu haladasat a globalShift + longitudinalAxis modellezi.
+- A keresztiranyu atfutas akkor kap magas pontot, ha:
+  - a residual (kompenzalt) mozgas valoban jelen van,
+  - az objektum elmozdulasa a hossztengelyre meroleges komponensben eros,
+  - a jel lokalisan koncentralt, es nem teljes kepes villodas.
+- Emiatt ugyanaz a logika kezeli a jobbrol-balra es balrol-jobbra keresztmozgast is.
 
 ## 6. Mit lat a felhasznalo a talalatoknal?
 Minden talalatnal:
