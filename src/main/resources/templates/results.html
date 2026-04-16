@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="hu" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LookupInVideo | Talalatok</title>
+    <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<div class="bg-orb bg-orb-left"></div>
+<div class="bg-orb bg-orb-right"></div>
+
+<main class="container">
+    <section class="hero compact">
+        <p class="kicker">Talalati lista</p>
+        <h1 th:text="'Kereses: ' + ${outcome.query}"></h1>
+        <p class="lead" th:text="${outcome.mode}"></p>
+        <p class="meta" th:text="'Video hossza: ' + ${outcome.formattedDuration} + ' | Talalatok: ' + ${#lists.size(outcome.matches)}"></p>
+        <p class="note" th:text="${outcome.note}"></p>
+    </section>
+
+    <section class="panel">
+        <video id="videoPlayer" controls class="video-player">
+            <source th:src="@{/media/{id}(id=${outcome.videoId})}" type="video/mp4">
+            A bongeszod nem tamogatja a video lejatszast.
+        </video>
+
+        <div class="actions">
+            <a class="cta secondary" th:href="@{/}">Uj kereses</a>
+        </div>
+    </section>
+
+    <section class="results-grid" th:if="${!#lists.isEmpty(outcome.matches)}">
+        <article class="result-card" th:each="match : ${outcome.matches}">
+            <img th:if="${match.previewDataUrl != ''}" th:src="${match.previewDataUrl}" alt="Jelenet elo-nezet">
+            <div class="result-content">
+                <h3 th:text="'Idopont: ' + ${match.formattedTimestamp}"></h3>
+                <p th:text="${match.reason}"></p>
+                <button class="jump"
+                        type="button"
+                        th:attr="data-seconds=${match.timestampSeconds}"
+                        onclick="seekTo(this)">Ugras a videohoz</button>
+            </div>
+        </article>
+    </section>
+
+    <section class="panel" th:if="${#lists.isEmpty(outcome.matches)}">
+        <p>Ehhez a kereseshez nem talaltunk eleg eros jelenetet. Probald masik kulcsszoval vagy masik videoval.</p>
+    </section>
+</main>
+
+<script>
+    function seekTo(button) {
+        const video = document.getElementById('videoPlayer');
+        const seconds = Number(button.getAttribute('data-seconds'));
+        if (!Number.isNaN(seconds)) {
+            video.currentTime = seconds;
+            video.play();
+            video.scrollIntoView({behavior: 'smooth', block: 'center'});
+        }
+    }
+</script>
+</body>
+</html>

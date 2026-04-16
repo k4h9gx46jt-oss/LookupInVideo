@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="hu" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LookupInVideo | Jelenetkereses</title>
+    <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<div class="bg-orb bg-orb-left"></div>
+<div class="bg-orb bg-orb-right"></div>
+
+<main class="container">
+    <section class="hero">
+        <p class="kicker">LookupInVideo</p>
+        <h1>Video jelenetek keresese szoveges leirassal</h1>
+        <p class="lead">
+            Tolts fel egy videot, majd ird be mit keresel (pl. "piros auto", "kutya", "kamion").
+            Ez az alapverzio mar visszaad hasznalhato jelenet-talalatokat, es jo kiindulopont tovabbi AI boviteshez.
+        </p>
+    </section>
+
+    <section class="panel">
+        <form th:action="@{/search}" method="post" enctype="multipart/form-data" class="search-form">
+            <label class="field">
+                <span>Video fajl</span>
+                <input type="file" name="video" accept="video/*" required>
+            </label>
+
+            <label class="field">
+                <span>Kereses</span>
+                <input type="text"
+                       name="query"
+                       placeholder="Pelda: piros auto, kutya, szarvas"
+                       th:value="${query}"
+                       required>
+            </label>
+
+            <button type="submit" class="cta">Kereses inditasa</button>
+        </form>
+
+        <p class="error" th:if="${error}" th:text="${error}"></p>
+
+        <div class="hint-box">
+            <strong>Megjegyzes az MVP-rol:</strong>
+            <p>
+                A "piros" tipusu kereses mar szinalapon mukodik.
+                Mas kifejezeseknel jelenleg mozgas-intenzitas alapjan rangsoroljuk a jeleneteket,
+                amit kovetkezo lepesben objektumfelismeressel (dog/deer/truck/car) lehet boviteni.
+            </p>
+        </div>
+    </section>
+</main>
+</body>
+</html>
