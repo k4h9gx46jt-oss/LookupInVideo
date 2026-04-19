@@ -18,8 +18,15 @@
                         border: 1px solid #444; border-radius: 6px; cursor: pointer;
                         font-size: 0.85rem; transition: background 0.2s; }
         .video-toggle:hover { background: #3a3060; color: #fff; }
+        .flip-btn { padding: 6px 14px; background: #2a2a45; color: #aaa;
+                    border: 1px solid #444; border-radius: 6px; cursor: pointer;
+                    font-size: 0.85rem; transition: background 0.2s; display: none; }
+        .flip-btn:hover { background: #3a3060; color: #fff; }
+        .flip-btn.active { background: #5a3060; color: #ffb3ff; border-color: #aa66cc; }
         .inline-player { width: 100%; max-height: 340px; border-radius: 8px;
-                         display: none; margin-bottom: 16px; }
+                         display: none; margin-bottom: 16px;
+                         transition: transform 0.3s; }
+        .inline-player.flipped { transform: rotate(180deg); }
         .no-match-note { color: #666; font-style: italic; font-size: 0.9rem; }
         .summary-bar { background: #1e1e2e; border: 1px solid #333; border-radius: 10px;
                        padding: 16px 24px; margin-bottom: 32px;
@@ -74,6 +81,10 @@
             <button class="video-toggle"
                     th:attr="data-videoid=${outcome.videoId}"
                     onclick="togglePlayer(this)">▶ Video megnyitasa</button>
+            <button class="flip-btn"
+                    th:attr="data-videoid=${outcome.videoId}"
+                    th:id="'flip-' + ${outcome.videoId}"
+                    onclick="flipPlayer(this)">&#x21BB; Megforditas</button>
         </div>
         <div class="file-body">
             <video class="inline-player"
@@ -105,10 +116,21 @@
     function togglePlayer(btn) {
         const videoId = btn.getAttribute('data-videoid');
         const player = document.getElementById('player-' + videoId);
+        const flipBtn = document.getElementById('flip-' + videoId);
         if (!player) return;
         const visible = player.style.display === 'block';
         player.style.display = visible ? 'none' : 'block';
         btn.textContent = visible ? '▶ Video megnyitasa' : '✕ Video bezarasa';
+        if (flipBtn) flipBtn.style.display = visible ? 'none' : 'inline-block';
+    }
+
+    function flipPlayer(btn) {
+        const videoId = btn.getAttribute('data-videoid');
+        const player = document.getElementById('player-' + videoId);
+        if (!player) return;
+        const flipped = player.classList.toggle('flipped');
+        btn.classList.toggle('active', flipped);
+        btn.textContent = flipped ? '\u21BB Talpra allitva' : '\u21BB Megforditas';
     }
 
     function seekTo(btn) {
@@ -127,6 +149,9 @@
             player.play();
             player.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
+        const flipBtn = player.closest('.file-body').previousElementSibling
+                            .querySelector('.flip-btn');
+        if (flipBtn) flipBtn.style.display = 'inline-block';
     }
 </script>
 </body>
