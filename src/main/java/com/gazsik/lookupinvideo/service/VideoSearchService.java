@@ -715,7 +715,7 @@ public class VideoSearchService {
     private static boolean isMatch(QueryMode mode, double score) {
         return switch (mode) {
             case COLOR -> score >= 0.14;
-            case DEER -> score >= 0.20;
+            case DEER -> score >= 0.21;
             case MOTION -> score >= 0.18;
         };
     }
