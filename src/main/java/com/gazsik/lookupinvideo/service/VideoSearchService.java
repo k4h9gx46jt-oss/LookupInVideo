@@ -134,10 +134,11 @@ public class VideoSearchService {
                     videoRegistry.put(videoId, videoPath);
                     try {
                         SearchOutcome outcome = analyzeVideo(videoId, videoPath, q, fileName, progress);
-                        progress.fileCompleted(fileName);
+                        int matchCount = outcome.getMatches().isEmpty() ? 0 : outcome.getMatches().size();
+                        progress.fileCompleted(fileName, matchCount);
                         return outcome.getMatches().isEmpty() ? null : outcome;
                     } catch (Exception ex) {
-                        progress.fileCompleted(fileName);
+                        progress.fileCompleted(fileName, 0);
                         return null;
                     }
                 }, pool))

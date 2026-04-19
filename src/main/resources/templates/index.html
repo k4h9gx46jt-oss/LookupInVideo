@@ -52,6 +52,13 @@
         .prog-label { color: #ccc; font-size: 0.82rem; text-align: left; margin-bottom: 4px; }
         .prog-bar-wrap { background: #2a2a3d; border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
         .prog-bar-inner { height: 10px; background: #6c63ff; width: 0%; transition: width 0.4s; }
+        .prog-bar-inner.shimmer {
+            background: linear-gradient(90deg, #6c63ff 25%, #a89fff 50%, #6c63ff 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.4s linear infinite;
+            width: 100% !important;
+        }
+        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
         .prog-bar-inner.green { background: #44c868; height: 22px; }
         .prog-pct-row { position: relative; margin-bottom: 6px; }
         .prog-pct-row .prog-bar-inner { height: 22px; }
@@ -179,6 +186,7 @@
             <span class="prog-pct-label" id="progPct">0%</span>
         </div>
         <p class="prog-file-count" id="progFileCount"></p>
+        <p id="progMatchCount" style="color:#44c868; font-size:0.9rem; margin-bottom:20px; display:none;"></p>
 
         <button class="prog-cancel" onclick="cancelSearch()">Megszakitas</button>
     </div>
@@ -298,18 +306,32 @@
     function updateOverlay(p) {
         document.getElementById('progStatus').textContent     = p.statusText || '';
 
-        // Frame bar: csak szekvencialis modban ertelmes
+        // Frame bar: szekvencialis modban valodi %, parhuzamos modban shimmer animacio
         const frameSection = document.getElementById('progFrameSection');
-        if (frameSection) frameSection.style.display = p.parallelMode ? 'none' : 'block';
-        document.getElementById('progFrameBar').style.width   = (p.framePercent || 0) + '%';
+        const frameBar     = document.getElementById('progFrameBar');
+        if (frameSection) frameSection.style.display = 'block';
+        if (p.parallelMode) {
+            frameBar.classList.add('shimmer');
+            frameBar.style.width = '';
+        } else {
+            frameBar.classList.remove('shimmer');
+            frameBar.style.width = (p.framePercent || 0) + '%';
+        }
 
         document.getElementById('progOverallBar').style.width = (p.percent || 0) + '%';
         document.getElementById('progPct').textContent        = (p.percent || 0) + '%';
         if (p.total > 0) {
             const label = p.parallelMode
-                ? p.processed + ' / ' + p.total + ' fajl kesz  |  ' + p.threadCount + ' szal parhuzamosan'
+                ? p.processed + ' / ' + p.total + ' fajl kesz  |  ' + p.threadCount + ' szal'
                 : p.processed + ' / ' + p.total + ' fajl feldolgozva';
             document.getElementById('progFileCount').textContent = label;
+        }
+        const matchEl = document.getElementById('progMatchCount');
+        if (p.matchesFound > 0) {
+            matchEl.style.display = 'block';
+            matchEl.textContent = '✓ ' + p.matchesFound + ' talalat eddig';
+        } else {
+            matchEl.style.display = 'none';
         }
     }
 

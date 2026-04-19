@@ -207,8 +207,11 @@ public class VideoSearchController {
         }
         JobProgress progress = videoSearchService.getProgress(jobId);
         int totalScanned = progress != null ? progress.getTotal() : outcomes.size();
+        int totalMatches = 0;
+        for (SearchOutcome o : outcomes) totalMatches += o.getMatches().size();
         model.addAttribute("outcomes", outcomes);
         model.addAttribute("totalScanned", totalScanned);
+        model.addAttribute("totalMatches", totalMatches);
         String q = outcomes.isEmpty() ? "" : outcomes.get(0).getQuery();
         model.addAttribute("query", q);
         return "results-dir";

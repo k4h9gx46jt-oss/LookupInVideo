@@ -7,6 +7,7 @@ public class JobProgress {
     public enum Status { RUNNING, DONE, ERROR }
 
     private final AtomicInteger processed = new AtomicInteger(0);
+    private final AtomicInteger matchesFound = new AtomicInteger(0);
     private volatile int total = 0;
     private volatile int framePercent = 0;
     private volatile String currentFile = "";
@@ -16,6 +17,7 @@ public class JobProgress {
     private volatile boolean parallelMode = false;
     private volatile int threadCount = 1;
 
+    public int getMatchesFound() { return matchesFound.get(); }
     public int getProcessed()      { return processed.get(); }
     public int getTotal()          { return total; }
     public int getFramePercent()   { return parallelMode ? 0 : framePercent; }
@@ -53,9 +55,11 @@ public class JobProgress {
     }
 
     /** Parhuzamos mod: thread-safe, minden fajl befejezesekor hivando. */
-    public int fileCompleted(String fileName) {
+    public int fileCompleted(String fileName, int matchCount) {
+        matchesFound.addAndGet(matchCount);
         int done = processed.incrementAndGet();
-        this.statusText = String.format("%d / %d fajl kesz", done, total);
+        int m = matchesFound.get();
+        this.statusText = String.format("%d / %d fajl kesz  |  %d talalat", done, total, m);
         return done;
     }
 

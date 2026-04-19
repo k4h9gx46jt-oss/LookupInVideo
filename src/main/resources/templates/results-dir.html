@@ -50,7 +50,7 @@
         </div>
         <div class="stat">
             <div class="stat-num"
-                 th:text="${outcomes.isEmpty() ? 0 : outcomes.stream().mapToInt(o -> o.matches.size()).sum()}"></div>
+                 th:text="${totalMatches}"></div>
             <div class="stat-label">osszes talalat</div>
         </div>
         <div style="flex:1; text-align:right;">
