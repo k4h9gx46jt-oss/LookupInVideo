@@ -118,6 +118,20 @@ public class VideoSearchController {
         }
     }
 
+    @PostMapping("/search-async")
+    @ResponseBody
+    public Map<String, String> searchAsync(@RequestParam("video") MultipartFile video,
+                                            @RequestParam("query") String query) {
+        if (video == null || video.isEmpty()) return Map.of("error", "Tolts fel egy videot.");
+        if (query == null || query.isBlank())  return Map.of("error", "Add meg a keresesi szoveget.");
+        try {
+            String jobId = videoSearchService.startSingleUploadSearch(video, query);
+            return Map.of("jobId", jobId);
+        } catch (Exception ex) {
+            return Map.of("error", ex.getMessage());
+        }
+    }
+
     @PostMapping("/search-local")
     public String searchLocal(@RequestParam("videoDir") String videoDir,
                               @RequestParam("videoFile") String videoFile,
@@ -159,6 +173,39 @@ public class VideoSearchController {
             model.addAttribute("videoFiles", Collections.emptyList());
             return "index";
         }
+    }
+
+    @PostMapping("/search-local-async")
+    @ResponseBody
+    public Map<String, String> searchLocalAsync(@RequestParam("videoDir") String videoDir,
+                                                 @RequestParam("videoFile") String videoFile,
+                                                 @RequestParam("query") String query) {
+        if (videoDir == null || videoDir.isBlank() || videoFile == null || videoFile.isBlank())
+            return Map.of("error", "Valassz ki egy videofajlt.");
+        if (query == null || query.isBlank()) return Map.of("error", "Add meg a keresesi szoveget.");
+        Path videoPath = Paths.get(videoDir).toAbsolutePath().normalize().resolve(videoFile);
+        if (!Files.exists(videoPath) || !Files.isRegularFile(videoPath))
+            return Map.of("error", "A fajl nem talalhato: " + videoPath);
+        try {
+            String jobId = videoSearchService.startSinglePathSearch(videoPath, query);
+            return Map.of("jobId", jobId);
+        } catch (Exception ex) {
+            return Map.of("error", ex.getMessage());
+        }
+    }
+
+    @GetMapping("/result-single/{jobId}")
+    public String getSingleResult(@PathVariable String jobId, Model model) {
+        SearchOutcome outcome = videoSearchService.getSingleResult(jobId);
+        if (outcome == null) {
+            model.addAttribute("error", "Az eredmeny nem elerheto.");
+            model.addAttribute("query", "");
+            model.addAttribute("videoDir", "");
+            model.addAttribute("videoFiles", Collections.emptyList());
+            return "index";
+        }
+        model.addAttribute("outcome", outcome);
+        return "results";
     }
 
     @PostMapping("/search-dir")

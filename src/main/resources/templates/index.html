@@ -138,7 +138,7 @@
                     <input type="text" name="query" id="localQuery"
                            th:value="${query}"
                            placeholder="Pelda: piros auto, kutya, szarvas">
-                    <button type="submit" onclick="return validateLocal()">Kereses (kivalasztott fajl)</button>
+                    <button type="button" onclick="searchSingle()">Kereses (kivalasztott fajl)</button>
                     <button type="button" class="btn-all" onclick="searchDir()">Kereses az egesz konyvtarban</button>
                 </div>
             </form>
@@ -147,7 +147,7 @@
         <!-- === FELTÖLTÉS TAB === -->
         <div class="tab-panel" id="tab-upload">
             <form th:action="@{/search}" method="post" enctype="multipart/form-data"
-                  class="search-form" style="margin-top:18px;">
+                  id="upload-form" class="search-form" style="margin-top:18px;">
                 <label class="field">
                     <span>Video fajl feltoltese</span>
                     <input type="file" name="video" accept="video/*" required>
@@ -242,13 +242,58 @@
                 extEl.textContent = parts[parts.length - 1].toUpperCase();
             }
         });
+
+        // Feltoltes form: async progress
+        const uploadForm = document.getElementById('upload-form');
+        if (uploadForm) {
+            uploadForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                const fileInput = this.querySelector('[name="video"]');
+                const queryInput = this.querySelector('[name="query"]');
+                if (!fileInput || !fileInput.files[0]) { alert('Tolts fel egy videot!'); return; }
+                if (!queryInput || !queryInput.value.trim()) { alert('Adj meg egy keresesi szoveget!'); return; }
+                showOverlay();
+                const fd = new FormData();
+                fd.append('video', fileInput.files[0]);
+                fd.append('query', queryInput.value.trim());
+                fetch('/search-async', { method: 'POST', body: fd })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) { hideOverlay(); alert('Hiba: ' + data.error); return; }
+                    _resultUrl = '/result-single/' + data.jobId;
+                    _pollActive = true;
+                    pollProgress(data.jobId);
+                })
+                .catch(err => { hideOverlay(); alert('Halozati hiba: ' + err.message); });
+            });
+        }
     });
 
     // -----------------------------------------------------------------------
     // Könyvtár-szintű keresés + progress
     // -----------------------------------------------------------------------
-    let _pollActive = false;
+    let _pollActive = false;    let _resultUrl  = '';
 
+    function searchSingle() {
+        if (!selectedFile) { alert('Kerjuk, kattints egy videofajlra a listabol!'); return; }
+        const q = document.getElementById('localQuery').value.trim();
+        if (!q) { alert('Adj meg egy szoveges keresest!'); return; }
+        const dir = document.getElementById('dirInput').value.trim();
+        showOverlay();
+        fetch('/search-local-async', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ videoDir: dir, videoFile: selectedFile, query: q })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) { hideOverlay(); alert('Hiba: ' + data.error); return; }
+            _resultUrl = '/result-single/' + data.jobId;
+            _pollActive = true;
+            pollProgress(data.jobId);
+        })
+        .catch(err => { hideOverlay(); alert('Halozati hiba: ' + err.message); });
+    }
     function searchDir() {
         const dir = document.getElementById('dirInput').value.trim();
         const q   = document.getElementById('localQuery').value.trim();
@@ -269,6 +314,7 @@
                 alert('Hiba: ' + data.error);
                 return;
             }
+            _resultUrl = '/results/' + data.jobId;
             _pollActive = true;
             pollProgress(data.jobId);
         })
@@ -286,7 +332,7 @@
             updateOverlay(p);
             if (p.status === 'DONE') {
                 _pollActive = false;
-                window.location.href = '/results/' + jobId;
+                window.location.href = _resultUrl;
             } else if (p.status === 'ERROR') {
                 _pollActive = false;
                 hideOverlay();

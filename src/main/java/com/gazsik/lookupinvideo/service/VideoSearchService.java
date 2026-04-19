@@ -55,6 +55,7 @@ public class VideoSearchService {
     private final Map<String, Path> videoRegistry = new ConcurrentHashMap<>();
     private final Map<String, JobProgress> progressMap = new ConcurrentHashMap<>();
     private final Map<String, List<SearchOutcome>> dirResultMap = new ConcurrentHashMap<>();
+    private final Map<String, SearchOutcome> singleResultMap = new ConcurrentHashMap<>();
 
     public VideoSearchService(@Value("${lookup.video.storage-path:uploads}") String storageDir) throws IOException {
         this.storagePath = Paths.get(storageDir).toAbsolutePath().normalize();
@@ -79,6 +80,71 @@ public class VideoSearchService {
         videoRegistry.put(videoId, targetPath);
         String displayName = videoFile.getOriginalFilename() != null ? videoFile.getOriginalFilename() : safeName;
         return analyzeVideo(videoId, targetPath, query == null ? "" : query.trim(), displayName, null);
+    }
+
+    /** Async feltoltes + elemzes — progress kovetessel. */
+    public String startSingleUploadSearch(MultipartFile videoFile, String query) {
+        if (videoFile == null || videoFile.isEmpty()) {
+            throw new IllegalArgumentException("Nem erkezett video fajl.");
+        }
+        String videoId = UUID.randomUUID().toString();
+        String safeName = sanitizeFileName(videoFile.getOriginalFilename());
+        Path targetPath = storagePath.resolve(videoId + "-" + safeName);
+        try (InputStream in = videoFile.getInputStream()) {
+            Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException ex) {
+            throw new IllegalStateException("A video mentese sikertelen.", ex);
+        }
+        videoRegistry.put(videoId, targetPath);
+        String displayName = videoFile.getOriginalFilename() != null ? videoFile.getOriginalFilename() : safeName;
+
+        String jobId = UUID.randomUUID().toString();
+        JobProgress progress = new JobProgress();
+        progress.startFile(0, 1, displayName);
+        progressMap.put(jobId, progress);
+
+        final String q = query == null ? "" : query.trim();
+        final String vid = videoId;
+        final Path path = targetPath;
+        final String name = displayName;
+        CompletableFuture.runAsync(() -> {
+            try {
+                SearchOutcome outcome = analyzeVideo(vid, path, q, name, progress);
+                singleResultMap.put(jobId, outcome);
+                progress.done(1);
+            } catch (Exception ex) {
+                progress.error(ex.getMessage());
+            }
+        });
+        return jobId;
+    }
+
+    /** Async helyi fajl elemzes — progress kovetessel. */
+    public String startSinglePathSearch(Path videoPath, String query) {
+        if (videoPath == null || !Files.exists(videoPath)) {
+            throw new IllegalArgumentException("A videofajl nem talalhato: " + videoPath);
+        }
+        String videoId = UUID.randomUUID().toString();
+        videoRegistry.put(videoId, videoPath);
+        String displayName = videoPath.getFileName().toString();
+
+        String jobId = UUID.randomUUID().toString();
+        JobProgress progress = new JobProgress();
+        progress.startFile(0, 1, displayName);
+        progressMap.put(jobId, progress);
+
+        final String q = query == null ? "" : query.trim();
+        final String vid = videoId;
+        CompletableFuture.runAsync(() -> {
+            try {
+                SearchOutcome outcome = analyzeVideo(vid, videoPath, q, displayName, progress);
+                singleResultMap.put(jobId, outcome);
+                progress.done(1);
+            } catch (Exception ex) {
+                progress.error(ex.getMessage());
+            }
+        });
+        return jobId;
     }
 
     public SearchOutcome searchByPath(Path videoPath, String query) {
@@ -166,6 +232,10 @@ public class VideoSearchService {
 
     public List<SearchOutcome> getDirectoryResults(String jobId) {
         return dirResultMap.get(jobId);
+    }
+
+    public SearchOutcome getSingleResult(String jobId) {
+        return singleResultMap.get(jobId);
     }
 
     private SearchOutcome analyzeVideo(String videoId, Path videoPath, String query,
