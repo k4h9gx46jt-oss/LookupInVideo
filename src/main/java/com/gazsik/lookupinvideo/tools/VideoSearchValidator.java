@@ -21,7 +21,8 @@ public final class VideoSearchValidator {
             "/Users/SEV0A/java/LookupInVideo/liveformowncam/NO20260415-160202-000356.mp4",
             "/Users/SEV0A/java/LookupInVideo/liveformowncam/NO20260415-160302-000357.mp4",
             "/Users/SEV0A/java/LookupInVideo/liveformowncam/NO20260415-160803-000362.mp4",
-            "/Users/SEV0A/java/LookupInVideo/demoVideo/Demo1.mp4"
+            "/Users/SEV0A/java/LookupInVideo/demoVideo/Demo1.mp4",
+            "/Users/SEV0A/java/LookupInVideo/demoVideo/YTDown.com_YouTube_Deer-Hit-SMACK-at-60-MPH-II-Dash-Cam-WAR_Media_ARAbzOi-Z8Q_001_1080p.mp4"
     );
 
     private VideoSearchValidator() {

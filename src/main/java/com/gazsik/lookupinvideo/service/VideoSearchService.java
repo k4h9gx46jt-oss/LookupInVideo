@@ -72,7 +72,8 @@ public class VideoSearchService {
     private static final int ANALYSIS_WIDTH_CPU = 320;
     private static final int ANALYSIS_WIDTH_GPU = 512;
     private static final int MAX_MATCHES = 12;
-    private static final double DEER_TIMESTAMP_LEAD_SECONDS = 1.1;
+    private static final double DEER_TIMESTAMP_LEAD_BASE_SECONDS = 1.1;
+    private static final double DEER_TIMESTAMP_LEAD_MAX_SECONDS = 4.7;
     private static final double DEER_CLUSTER_WINDOW_SECONDS = 2.6;
     private static final int GLOBAL_SHIFT_MAX_DX = 8;
     private static final int GLOBAL_SHIFT_MAX_DY = 6;
@@ -515,7 +516,8 @@ public class VideoSearchService {
                 double timestampSeconds = timestampUs / 1_000_000.0;
                 if (mode == QueryMode.DEER) {
                     // Deer crossings are often scored at motion peak; shift towards crossing start for better UX.
-                    timestampSeconds = Math.max(0.0, timestampSeconds - DEER_TIMESTAMP_LEAD_SECONDS);
+                    double deerLeadSeconds = computeDeerTimestampLeadSeconds(motionMetrics, lateralTrackScore, score);
+                    timestampSeconds = Math.max(0.0, timestampSeconds - deerLeadSeconds);
                 }
                 matches.add(new SceneMatch(timestampSeconds, score, reason, preview));
 
@@ -602,7 +604,7 @@ public class VideoSearchService {
     private static boolean isMatch(QueryMode mode, double score) {
         return switch (mode) {
             case COLOR -> score >= 0.14;
-            case DEER -> score >= 0.22;
+            case DEER -> score >= 0.20;
             case MOTION -> score >= 0.18;
         };
     }
@@ -968,6 +970,22 @@ public class VideoSearchService {
 
     private static double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    private static double computeDeerTimestampLeadSeconds(MotionMetrics motion,
+                                                          double lateralTrackScore,
+                                                          double score) {
+        double centerLead = clamp((motion.centerRatio - 0.18) / 0.30, 0.0, 1.0) * 2.4;
+        double lowTravelLead = clamp((0.54 - motion.travelScore) / 0.30, 0.0, 1.0) * 0.9;
+        double stableCrossingLead = clamp((lateralTrackScore - 0.68) / 0.32, 0.0, 1.0) * 0.5;
+        double weakConfidenceLead = clamp((0.34 - score) / 0.16, 0.0, 1.0) * 3.5;
+
+        double leadSeconds = DEER_TIMESTAMP_LEAD_BASE_SECONDS
+                + centerLead
+                + lowTravelLead
+                + stableCrossingLead
+                + weakConfidenceLead;
+        return clamp(leadSeconds, DEER_TIMESTAMP_LEAD_BASE_SECONDS, DEER_TIMESTAMP_LEAD_MAX_SECONDS);
     }
 
     private static String sanitizeFileName(String originalName) {
