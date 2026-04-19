@@ -21,4 +21,4 @@ if [[ "$BUILD_ONLY" == true ]]; then
 fi
 
 echo "[LookupInVideo] Alkalmazas indul: http://localhost:${PORT}"
-exec ./mvnw spring-boot:run -Dspring-boot.run.jvmArguments="-Dserver.port=${PORT}"
+exec ./mvnw spring-boot:run -Dspring-boot.run.jvmArguments="-Xms28g -Xmx28g -Dserver.port=${PORT}"
