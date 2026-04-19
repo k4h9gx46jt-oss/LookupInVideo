@@ -51,7 +51,7 @@ public final class VideoSearchValidator {
             return;
         }
 
-        VideoSearchService service = new VideoSearchService("uploads", 0, 900L, true, false, 0);
+        VideoSearchService service = new VideoSearchService("uploads", 0, 900L, true, false, 0, 0);
         try {
             System.out.println("| file | matches | top_reason | elapsed_ms |");
             System.out.println("|---|---:|---|---:|");

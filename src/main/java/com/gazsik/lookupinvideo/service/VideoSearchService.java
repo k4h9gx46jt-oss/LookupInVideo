@@ -44,6 +44,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.bytedeco.javacpp.BytePointer;
@@ -72,6 +73,9 @@ public class VideoSearchService {
     private static final int ANALYSIS_WIDTH_CPU = 320;
     private static final int ANALYSIS_WIDTH_GPU = 512;
     private static final int MAX_MATCHES = 12;
+    /** Warm-up window before each non-zero segment start to prime EMA and axis state. */
+    private static final long SEGMENT_WARMUP_US = 2_000_000L;
+
     private static final double DEER_TIMESTAMP_LEAD_BASE_SECONDS = 1.1;
     private static final double DEER_TIMESTAMP_LEAD_MAX_SECONDS = 4.7;
     private static final double DEER_CLUSTER_WINDOW_SECONDS = 2.6;
@@ -116,13 +120,15 @@ public class VideoSearchService {
     private final String gpuProcessingStatus;
     private final boolean decodeHwAccelEnabled;
     private final int decodeThreadCount;
+    private final int configuredSegmentCount;
 
     public VideoSearchService(@Value("${lookup.video.storage-path:uploads}") String storageDir,
                               @Value("${lookup.video.analysis.max-threads:0}") int configuredAnalysisThreads,
                               @Value("${lookup.video.analysis.timeout-seconds:900}") long configuredAnalysisTimeoutSeconds,
                               @Value("${lookup.video.analysis.gpu-processing:true}") boolean gpuProcessingRequested,
                               @Value("${lookup.video.analysis.decode-hwaccel:false}") boolean decodeHwAccelEnabled,
-                              @Value("${lookup.video.analysis.decode-threads:0}") int decodeThreadCount) throws IOException {
+                              @Value("${lookup.video.analysis.decode-threads:0}") int decodeThreadCount,
+                              @Value("${lookup.video.analysis.intra-segment-count:0}") int configuredSegmentCount) throws IOException {
         try {
             avutil.av_log_set_level(avutil.AV_LOG_ERROR);
         } catch (Throwable ignored) {
@@ -133,9 +139,13 @@ public class VideoSearchService {
         Files.createDirectories(this.storagePath);
         this.analysisThreadCount = normalizeThreadCount(configuredAnalysisThreads);
         this.analysisTimeoutSeconds = Math.max(MIN_ANALYSIS_TIMEOUT_SECONDS, configuredAnalysisTimeoutSeconds);
+        this.configuredSegmentCount = Math.max(0, configuredSegmentCount);
         this.analysisExecutor = Executors.newFixedThreadPool(this.analysisThreadCount);
-        this.segmentExecutor = Executors.newFixedThreadPool(
-                Math.max(1, Runtime.getRuntime().availableProcessors()));
+        // Pool size = max segments any one video can use; bounded by configured value or CPU count.
+        int segPoolSize = this.configuredSegmentCount > 0
+                ? this.configuredSegmentCount
+                : Math.max(1, Runtime.getRuntime().availableProcessors());
+        this.segmentExecutor = Executors.newFixedThreadPool(segPoolSize);
         this.gpuProcessingEnabled = resolveGpuProcessingEnabled(gpuProcessingRequested);
         this.decodeHwAccelEnabled = decodeHwAccelEnabled;
         this.decodeThreadCount = decodeThreadCount;
@@ -335,21 +345,26 @@ public class VideoSearchService {
         long analysisDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(analysisTimeoutSeconds);
 
         int segmentCount = computeIntraVideoSegmentCount(durationUs);
+        // Shared progress tracker: each slot holds how many microseconds segment i has processed.
+        AtomicLong[] segProgUs = new AtomicLong[segmentCount];
+        for (int i = 0; i < segmentCount; i++) segProgUs[i] = new AtomicLong(0L);
         List<SceneMatch> matches;
 
         if (segmentCount <= 1) {
             matches = processVideoSegment(videoPath, 0L, Long.MAX_VALUE, durationUs,
-                    mode, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos, progress, fileName);
+                    mode, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
+                    progress, fileName, 0, segProgUs);
         } else {
             long segmentDuration = durationUs / segmentCount;
             List<CompletableFuture<List<SceneMatch>>> futures = new ArrayList<>();
             for (int i = 0; i < segmentCount; i++) {
                 final long startUs = (long) i * segmentDuration;
                 final long endUs = (i == segmentCount - 1) ? Long.MAX_VALUE : startUs + segmentDuration;
+                final int segIdx = i;
                 futures.add(CompletableFuture.supplyAsync(
                         () -> processVideoSegment(videoPath, startUs, endUs, durationUs,
                                 mode, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
-                                progress, fileName),
+                                progress, fileName, segIdx, segProgUs),
                         segmentExecutor));
             }
             matches = new ArrayList<>();
@@ -400,13 +415,20 @@ public class VideoSearchService {
             long sampleStepUs,
             long analysisDeadlineNanos,
             JobProgress progress,
-            String fileName) {
+            String fileName,
+            int segmentIndex,
+            AtomicLong[] segmentProgressUs) {
         List<SceneMatch> matches = new ArrayList<>();
         FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoPath.toFile());
         try {
             startGrabberWithGpuFallback(grabber, decodeHwAccelEnabled, decodeThreadCount);
-            if (segmentStartUs > 0L) {
-                grabber.setTimestamp(segmentStartUs);
+            // Seek to a warm-up window before the actual segment start so the EMA,
+            // longitudinal axis, and deer-track state are primed before emitting matches.
+            long warmupStartUs = (segmentStartUs > 0L)
+                    ? Math.max(0L, segmentStartUs - SEGMENT_WARMUP_US)
+                    : 0L;
+            if (warmupStartUs > 0L) {
+                grabber.setTimestamp(warmupStartUs);
             }
 
             Java2DFrameConverter converter = new Java2DFrameConverter();
@@ -419,7 +441,7 @@ public class VideoSearchService {
             double motionEma = 0.0;
             double previousActiveRatio = Double.NaN;
             List<TrackPoint> deerTrack = new ArrayList<>();
-            long nextSampleUs = segmentStartUs;
+            long nextSampleUs = warmupStartUs;
 
             Frame frame;
             while ((frame = grabber.grabImage()) != null) {
@@ -429,8 +451,15 @@ public class VideoSearchService {
                 long timestampUs = Math.max(grabber.getTimestamp(), 0L);
                 if (segmentEndUs != Long.MAX_VALUE && timestampUs >= segmentEndUs) break;
 
-                if (progress != null && fullVideoDurationUs > 0) {
-                    progress.updateFileFrame(fileName, (int) (timestampUs * 100L / fullVideoDurationUs));
+                if (progress != null && fullVideoDurationUs > 0 && segmentProgressUs != null) {
+                    // Update this segment's share monotonically (never go backward).
+                    long localUs = Math.max(0L, timestampUs - Math.max(0L, segmentStartUs));
+                    segmentProgressUs[segmentIndex].accumulateAndGet(localUs, Math::max);
+                    // Sum all segments to get a stable, never-decreasing overall percent.
+                    long totalUs = 0L;
+                    for (AtomicLong al : segmentProgressUs) totalUs += al.get();
+                    int percent = (int) Math.min(99L, totalUs * 100L / fullVideoDurationUs);
+                    progress.updateFileFrame(fileName, percent);
                 }
                 if (timestampUs < nextSampleUs) {
                     continue;
@@ -575,6 +604,11 @@ public class VideoSearchService {
 
                 nextSampleUs = advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
 
+                // During the warm-up window, update state but don't emit matches.
+                if (timestampUs < segmentStartUs) {
+                    continue;
+                }
+
                 if (!isMatch(mode, score)) {
                     continue;
                 }
@@ -624,8 +658,12 @@ public class VideoSearchService {
         if (durationUs < 5_000_000L) {
             return 1;
         }
+        if (configuredSegmentCount > 0) {
+            // Explicit override from application.properties.
+            return configuredSegmentCount;
+        }
         int cores = Runtime.getRuntime().availableProcessors();
-        // One segment per ~4 seconds, capped at the number of available CPU cores.
+        // Auto: one segment per ~4 seconds, capped at CPU core count.
         int byDuration = (int) Math.max(1L, durationUs / 4_000_000L);
         return Math.min(cores, byDuration);
     }
