@@ -48,6 +48,9 @@ public class VideoSearchService {
     private static final int GLOBAL_SHIFT_MAX_DX = 8;
     private static final int GLOBAL_SHIFT_MAX_DY = 6;
     private static final int GLOBAL_SHIFT_SAMPLE_STRIDE = 4;
+    private static final double ONCOMING_CENTER_RATIO_MIN = 0.58;
+    private static final double ONCOMING_LATERAL_TRAVEL_MAX = 0.012;
+    private static final double ONCOMING_ACTIVE_GROWTH_MIN = 0.003;
     private static final List<String> VIDEO_EXTENSIONS =
             List.of(".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg");
 
@@ -242,6 +245,7 @@ public class VideoSearchService {
                                         String fileName, JobProgress progress) {
         String normalizedQuery = stripAccents(query).toLowerCase(Locale.ROOT);
         QueryMode mode = resolveMode(normalizedQuery);
+        ColorQuery colorQuery = resolveColorQuery(normalizedQuery);
 
         List<SceneMatch> matches = new ArrayList<>();
 
@@ -257,6 +261,7 @@ public class VideoSearchService {
             double longitudinalAxisX = 0.0;
             double longitudinalAxisY = 1.0;
             double motionEma = 0.0;
+            double previousActiveRatio = Double.NaN;
             long nextSampleUs = 0L;
 
             Frame frame;
@@ -275,7 +280,6 @@ public class VideoSearchService {
                 }
 
                 BufferedImage scaled = scale(image, 320);
-                double redScore = computeRedRatio(scaled);
 
                 MotionMetrics motionMetrics = previousSample == null
                         ? MotionMetrics.empty()
@@ -309,16 +313,31 @@ public class VideoSearchService {
                 motionEma = motionEma == 0.0
                     ? burstBase
                     : (motionEma * 0.85 + burstBase * 0.15);
+                double activeGrowth = Double.isNaN(previousActiveRatio)
+                        ? 0.0
+                        : Math.max(0.0, motionMetrics.activeRatio - previousActiveRatio);
+                previousActiveRatio = motionMetrics.activeRatio;
                 previousSample = scaled;
 
                 double score;
                 String reason;
 
-                if (mode == QueryMode.RED) {
-                    score = redScore;
-                    reason = String.format(Locale.ROOT, "Piros dominancia: %.1f%%", redScore * 100);
+                if (mode == QueryMode.COLOR) {
+                    double colorDominance = computeColorDominance(scaled, colorQuery);
+                    double colorMotionBoost = clamp((motionMetrics.residualIntensity - 0.010) / 0.070, 0.0, 1.0);
+                    score = clamp(colorDominance * 0.78 + colorMotionBoost * 0.22, 0.0, 1.0);
+                    reason = String.format(
+                            Locale.ROOT,
+                            "Szindominancia (%s): %.1f%% | Mozgas-boost: %.1f%%",
+                            colorQuery.displayName(),
+                            colorDominance * 100,
+                            colorMotionBoost * 100
+                    );
                 } else if (mode == QueryMode.DEER) {
-                    score = computeDeerScore(motionMetrics, burstScore);
+                    if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)) {
+                        continue;
+                    }
+                    score = computeDeerScore(motionMetrics, burstScore, activeGrowth);
                     reason = String.format(
                             Locale.ROOT,
                             "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%%",
@@ -367,12 +386,12 @@ public class VideoSearchService {
 
             String modeLabel;
             String note;
-            if (mode == QueryMode.RED) {
-                modeLabel = "Szinalapu kereses (piros dominancia)";
-                note = "A kereses most a piros szin dominanciajara optimalizalt, jo alap a tovabbi boviteshez.";
+            if (mode == QueryMode.COLOR) {
+                modeLabel = "Szinalapu kereses (piros / zold / kek)";
+                note = "A piros/red, zold/green es kek/blue kulcsszavak szinalapu keresest hasznalnak, mozgas-boosttal a hirtelen kepen athuzo targyakhoz.";
             } else if (mode == QueryMode.DEER) {
                 modeLabel = "Szarvas keresese keresztmozgas alapjan";
-                note = "A szarvas/deer kulcsszavaknal hattermozgast kompenzalunk, majd a keresztiranyu lokalis mozgast pontozzuk (ugyanazzal a logikaval jobbrol-balra es balrol-jobbra esetben is).";
+                note = "A szarvas/deer kulcsszavaknal a keresztiranyu mozgas dominans, az oncoming vehicles (szembol kozeledo jarmuvek) jellegu mintakat szurjuk.";
             } else {
                 modeLabel = "Demo: mozgasalapu jelenet-kereses";
                 note = "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
@@ -385,13 +404,29 @@ public class VideoSearchService {
     }
 
     private static QueryMode resolveMode(String normalizedQuery) {
-        if (normalizedQuery.contains("piros") || normalizedQuery.contains("red")) {
-            return QueryMode.RED;
+        if (containsColorKeyword(normalizedQuery)) {
+            return QueryMode.COLOR;
         }
         if (normalizedQuery.contains("szarvas") || normalizedQuery.contains("deer")) {
             return QueryMode.DEER;
         }
         return QueryMode.MOTION;
+    }
+
+    private static boolean containsColorKeyword(String normalizedQuery) {
+        return normalizedQuery.contains("piros") || normalizedQuery.contains("red")
+                || normalizedQuery.contains("zold") || normalizedQuery.contains("green")
+                || normalizedQuery.contains("kek") || normalizedQuery.contains("blue");
+    }
+
+    private static ColorQuery resolveColorQuery(String normalizedQuery) {
+        boolean wantsRed = normalizedQuery.contains("piros") || normalizedQuery.contains("red");
+        boolean wantsGreen = normalizedQuery.contains("zold") || normalizedQuery.contains("green");
+        boolean wantsBlue = normalizedQuery.contains("kek") || normalizedQuery.contains("blue");
+        if (!wantsRed && !wantsGreen && !wantsBlue) {
+            wantsRed = true;
+        }
+        return new ColorQuery(wantsRed, wantsGreen, wantsBlue);
     }
 
     private static long sampleStepForMode(QueryMode mode) {
@@ -400,8 +435,8 @@ public class VideoSearchService {
 
     private static boolean isMatch(QueryMode mode, double score) {
         return switch (mode) {
-            case RED -> score >= 0.12;
-            case DEER -> score >= 0.09;
+            case COLOR -> score >= 0.14;
+            case DEER -> score >= 0.14;
             case MOTION -> score >= 0.18;
         };
     }
@@ -418,7 +453,7 @@ public class VideoSearchService {
         representatives.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
 
         double topScore = representatives.get(0).getConfidence();
-        double dynamicThreshold = clamp(topScore * 0.50, 0.09, 0.29);
+        double dynamicThreshold = clamp(topScore * 0.55, 0.14, 0.34);
 
         List<SceneMatch> filtered = new ArrayList<>();
         for (SceneMatch candidate : representatives) {
@@ -493,25 +528,45 @@ public class VideoSearchService {
         return false;
     }
 
-    private static double computeDeerScore(MotionMetrics motion, double burstScore) {
+    private static double computeDeerScore(MotionMetrics motion, double burstScore, double activeGrowth) {
         double compactness = motion.activeRatio <= 0.0001
                 ? 0.0
             : clamp((motion.residualIntensity / motion.activeRatio) / 3.7, 0.0, 1.0);
         double foregroundIsolation = 1.0 - clamp(motion.activeRatio / 0.14, 0.0, 1.0);
-        double residualGate = clamp((motion.residualIntensity - 0.010) / 0.070, 0.0, 1.0);
-        double directionalConfidence = clamp(motion.crossMotionRatio * motion.travelScore * residualGate, 0.0, 1.0);
-        double laneCenterFocus = 1.0 - clamp(Math.abs(motion.centroidX - 0.5) / 0.5, 0.0, 1.0);
+        double residualGate = clamp((motion.residualIntensity - 0.018) / 0.072, 0.0, 1.0);
+        double lateralTravelGate = clamp((motion.crossTravel - 0.004) / 0.034, 0.0, 1.0);
+        double directionalConfidence = clamp(
+                ((motion.crossMotionRatio * 0.55) + (lateralTravelGate * 0.45))
+                        * motion.travelScore
+                        * residualGate,
+                0.0,
+                1.0
+        );
+        double burstGate = clamp(burstScore / 0.075, 0.0, 1.0);
+        double oncomingPenalty = clamp((motion.centerRatio - ONCOMING_CENTER_RATIO_MIN) / 0.30, 0.0, 1.0)
+                * clamp((ONCOMING_LATERAL_TRAVEL_MAX - motion.crossTravel) / ONCOMING_LATERAL_TRAVEL_MAX, 0.0, 1.0)
+                * clamp((motion.parallelTravel - 0.004) / 0.030, 0.0, 1.0)
+                * clamp((activeGrowth - ONCOMING_ACTIVE_GROWTH_MIN) / 0.018, 0.0, 1.0);
 
         double combined =
-            directionalConfidence * 0.40 +
-            motion.residualIntensity * 0.22 +
-            motion.centerRatio * 0.11 +
-            burstScore * 0.10 +
+            directionalConfidence * 0.52 +
+            residualGate * 0.20 +
+            burstGate * 0.15 +
             foregroundIsolation * 0.06 +
-            compactness * 0.07 +
-            laneCenterFocus * 0.04;
+            compactness * 0.07;
+
+        combined -= oncomingPenalty * 0.28;
 
         return clamp(combined, 0.0, 1.0);
+    }
+
+    private static boolean looksLikeOncomingVehicle(MotionMetrics motion, double activeGrowth) {
+        boolean centerLocked = motion.centerRatio >= ONCOMING_CENTER_RATIO_MIN
+                && Math.abs(motion.centroidX - 0.5) <= 0.18;
+        boolean lowLateralTravel = motion.crossTravel <= ONCOMING_LATERAL_TRAVEL_MAX;
+        boolean forwardDominant = motion.parallelTravel >= (motion.crossTravel * 0.9);
+        boolean growingObject = activeGrowth >= ONCOMING_ACTIVE_GROWTH_MIN || motion.activeRatio >= 0.065;
+        return centerLocked && lowLateralTravel && forwardDominant && growingObject;
     }
 
     private static double clamp(double value, double min, double max) {
@@ -550,11 +605,13 @@ public class VideoSearchService {
         return scaled;
     }
 
-    private static double computeRedRatio(BufferedImage image) {
+    private static double computeColorDominance(BufferedImage image, ColorQuery colorQuery) {
         int width = image.getWidth();
         int height = image.getHeight();
         int total = 0;
         int redDominant = 0;
+        int greenDominant = 0;
+        int blueDominant = 0;
 
         for (int y = 0; y < height; y += 2) {
             for (int x = 0; x < width; x += 2) {
@@ -563,8 +620,18 @@ public class VideoSearchService {
                 int g = (rgb >> 8) & 0xFF;
                 int b = rgb & 0xFF;
 
-                if (r > 90 && r > (int) (g * 1.25) && r > (int) (b * 1.25)) {
+                int max = Math.max(r, Math.max(g, b));
+                int min = Math.min(r, Math.min(g, b));
+                int saturation = max - min;
+
+                if (r > 80 && saturation > 28 && r > (int) (g * 1.20) && r > (int) (b * 1.20)) {
                     redDominant++;
+                }
+                if (g > 80 && saturation > 28 && g > (int) (r * 1.15) && g > (int) (b * 1.15)) {
+                    greenDominant++;
+                }
+                if (b > 80 && saturation > 28 && b > (int) (r * 1.12) && b > (int) (g * 1.12)) {
+                    blueDominant++;
                 }
                 total++;
             }
@@ -573,7 +640,17 @@ public class VideoSearchService {
         if (total == 0) {
             return 0.0;
         }
-        return redDominant / (double) total;
+        double best = 0.0;
+        if (colorQuery.wantsRed) {
+            best = Math.max(best, redDominant / (double) total);
+        }
+        if (colorQuery.wantsGreen) {
+            best = Math.max(best, greenDominant / (double) total);
+        }
+        if (colorQuery.wantsBlue) {
+            best = Math.max(best, blueDominant / (double) total);
+        }
+        return best;
     }
 
     private static MotionMetrics computeMotionMetrics(BufferedImage previous,
@@ -687,10 +764,12 @@ public class VideoSearchService {
         double axisY = axisNorm < 1e-6 ? 1.0 : longitudinalAxisY / axisNorm;
 
         double crossMotionRatio = 0.0;
+        double crossTravel = 0.0;
+        double parallelTravel = 0.0;
         if (!Double.isNaN(previousCentroidX) && !Double.isNaN(previousCentroidY) && objectSpeed > 1e-6) {
-            double parallel = Math.abs(objectShiftX * axisX + objectShiftY * axisY);
-            double cross = Math.abs(objectShiftX * (-axisY) + objectShiftY * axisX);
-            crossMotionRatio = cross / (cross + parallel + 1e-6);
+            parallelTravel = Math.abs(objectShiftX * axisX + objectShiftY * axisY);
+            crossTravel = Math.abs(objectShiftX * (-axisY) + objectShiftY * axisX);
+            crossMotionRatio = crossTravel / (crossTravel + parallelTravel + 1e-6);
         }
 
         double travelScore = clamp(objectSpeed * 7.0, 0.0, 1.0);
@@ -703,6 +782,8 @@ public class VideoSearchService {
                 centroidX,
                 centroidY,
                 crossMotionRatio,
+                crossTravel,
+                parallelTravel,
                 travelScore,
                 shift.dx,
                 shift.dy
@@ -765,9 +846,35 @@ public class VideoSearchService {
     }
 
     private enum QueryMode {
-        RED,
+        COLOR,
         DEER,
         MOTION
+    }
+
+    private static final class ColorQuery {
+        private final boolean wantsRed;
+        private final boolean wantsGreen;
+        private final boolean wantsBlue;
+
+        private ColorQuery(boolean wantsRed, boolean wantsGreen, boolean wantsBlue) {
+            this.wantsRed = wantsRed;
+            this.wantsGreen = wantsGreen;
+            this.wantsBlue = wantsBlue;
+        }
+
+        private String displayName() {
+            List<String> names = new ArrayList<>();
+            if (wantsRed) {
+                names.add("piros");
+            }
+            if (wantsGreen) {
+                names.add("zold");
+            }
+            if (wantsBlue) {
+                names.add("kek");
+            }
+            return String.join("/", names);
+        }
     }
 
     private static final class MotionMetrics {
@@ -778,6 +885,8 @@ public class VideoSearchService {
         private final double centroidX;
         private final double centroidY;
         private final double crossMotionRatio;
+        private final double crossTravel;
+        private final double parallelTravel;
         private final double travelScore;
         private final double globalShiftX;
         private final double globalShiftY;
@@ -789,6 +898,8 @@ public class VideoSearchService {
                               double centroidX,
                               double centroidY,
                               double crossMotionRatio,
+                              double crossTravel,
+                              double parallelTravel,
                               double travelScore,
                               double globalShiftX,
                               double globalShiftY) {
@@ -799,13 +910,15 @@ public class VideoSearchService {
             this.centroidX = centroidX;
             this.centroidY = centroidY;
             this.crossMotionRatio = crossMotionRatio;
+            this.crossTravel = crossTravel;
+            this.parallelTravel = parallelTravel;
             this.travelScore = travelScore;
             this.globalShiftX = globalShiftX;
             this.globalShiftY = globalShiftY;
         }
 
         private static MotionMetrics empty() {
-            return new MotionMetrics(0.0, 0.0, 0.0, 0.0, 0.5, 0.68, 0.0, 0.0, 0.0, 0.0);
+            return new MotionMetrics(0.0, 0.0, 0.0, 0.0, 0.5, 0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         }
     }
 
