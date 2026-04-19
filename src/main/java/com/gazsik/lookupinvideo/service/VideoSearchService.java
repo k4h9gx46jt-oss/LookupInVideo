@@ -141,10 +141,11 @@ public class VideoSearchService {
         this.analysisTimeoutSeconds = Math.max(MIN_ANALYSIS_TIMEOUT_SECONDS, configuredAnalysisTimeoutSeconds);
         this.configuredSegmentCount = Math.max(0, configuredSegmentCount);
         this.analysisExecutor = Executors.newFixedThreadPool(this.analysisThreadCount);
-        // Pool size = max segments any one video can use; bounded by configured value or CPU count.
-        int segPoolSize = this.configuredSegmentCount > 0
-                ? this.configuredSegmentCount
-                : Math.max(1, Runtime.getRuntime().availableProcessors());
+        // Pool must fit ALL analysis threads each running their full segment slice simultaneously.
+        // Without this, analysis threads block each other waiting for the segment pool to free up,
+        // so only 1-2 videos ever make real progress at once (the old pool-size-= bug).
+        int segsPerVideo = this.configuredSegmentCount > 0 ? this.configuredSegmentCount : 1;
+        int segPoolSize = this.analysisThreadCount * segsPerVideo;
         this.segmentExecutor = Executors.newFixedThreadPool(segPoolSize);
         this.gpuProcessingEnabled = resolveGpuProcessingEnabled(gpuProcessingRequested);
         this.decodeHwAccelEnabled = decodeHwAccelEnabled;
