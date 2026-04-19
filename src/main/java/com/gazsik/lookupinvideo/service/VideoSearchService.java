@@ -68,7 +68,9 @@ import static org.bytedeco.opencv.global.opencv_imgproc.threshold;
 public class VideoSearchService {
 
     private static final long DEFAULT_SAMPLE_STEP_US = 1_000_000L;
-    private static final long DEER_SAMPLE_STEP_US = 250_000L;
+    private static final long DEER_SAMPLE_STEP_US = 150_000L;
+    private static final int ANALYSIS_WIDTH_CPU = 320;
+    private static final int ANALYSIS_WIDTH_GPU = 512;
     private static final int MAX_MATCHES = 12;
     private static final double DEER_TIMESTAMP_LEAD_SECONDS = 1.1;
     private static final double DEER_CLUSTER_WINDOW_SECONDS = 2.6;
@@ -110,11 +112,15 @@ public class VideoSearchService {
     private final ExecutorService analysisExecutor;
     private final boolean gpuProcessingEnabled;
     private final String gpuProcessingStatus;
+    private final boolean decodeHwAccelEnabled;
+    private final int decodeThreadCount;
 
     public VideoSearchService(@Value("${lookup.video.storage-path:uploads}") String storageDir,
                               @Value("${lookup.video.analysis.max-threads:0}") int configuredAnalysisThreads,
                               @Value("${lookup.video.analysis.timeout-seconds:900}") long configuredAnalysisTimeoutSeconds,
-                              @Value("${lookup.video.analysis.gpu-processing:true}") boolean gpuProcessingRequested) throws IOException {
+                              @Value("${lookup.video.analysis.gpu-processing:true}") boolean gpuProcessingRequested,
+                              @Value("${lookup.video.analysis.decode-hwaccel:false}") boolean decodeHwAccelEnabled,
+                              @Value("${lookup.video.analysis.decode-threads:0}") int decodeThreadCount) throws IOException {
         try {
             avutil.av_log_set_level(avutil.AV_LOG_ERROR);
         } catch (Throwable ignored) {
@@ -127,6 +133,8 @@ public class VideoSearchService {
         this.analysisTimeoutSeconds = Math.max(MIN_ANALYSIS_TIMEOUT_SECONDS, configuredAnalysisTimeoutSeconds);
         this.analysisExecutor = Executors.newFixedThreadPool(this.analysisThreadCount);
         this.gpuProcessingEnabled = resolveGpuProcessingEnabled(gpuProcessingRequested);
+        this.decodeHwAccelEnabled = decodeHwAccelEnabled;
+        this.decodeThreadCount = decodeThreadCount;
         this.gpuProcessingStatus = gpuProcessingRequested
             ? (this.gpuProcessingEnabled ? "OpenCL GPU aktiv" : "GPU nem elerheto, CPU fallback")
             : "GPU mod kikapcsolva (config)";
@@ -319,10 +327,11 @@ public class VideoSearchService {
         List<SceneMatch> matches = new ArrayList<>();
 
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoPath.toFile())) {
-            startGrabberWithGpuFallback(grabber);
+            startGrabberWithGpuFallback(grabber, decodeHwAccelEnabled, decodeThreadCount);
 
             long durationUs = Math.max(grabber.getLengthInTime(), 0L);
             long sampleStepUs = sampleStepForMode(mode, durationUs);
+            int analysisWidth = gpuProcessingEnabled ? ANALYSIS_WIDTH_GPU : ANALYSIS_WIDTH_CPU;
             long analysisDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(analysisTimeoutSeconds);
             Java2DFrameConverter converter = new Java2DFrameConverter();
             OpenCVFrameConverter.ToMat matConverter = new OpenCVFrameConverter.ToMat();
@@ -358,7 +367,7 @@ public class VideoSearchService {
                     continue;
                 }
 
-                Mat scaledMat = scale(frameMat, 320);
+                Mat scaledMat = scale(frameMat, analysisWidth);
                 if (scaledMat == null || scaledMat.empty()) {
                     continue;
                 }
@@ -440,6 +449,7 @@ public class VideoSearchService {
                     if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
                         || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)
                         || looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
+                        || looksLikeLowCrossHighTrackVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
                         || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
                         || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
@@ -562,10 +572,10 @@ public class VideoSearchService {
             return DEFAULT_SAMPLE_STEP_US;
         }
         if (durationUs >= 360_000_000L) {
-            return 500_000L;
+            return 350_000L;
         }
         if (durationUs >= 180_000_000L) {
-            return 400_000L;
+            return 250_000L;
         }
         return DEER_SAMPLE_STEP_US;
     }
@@ -679,8 +689,8 @@ public class VideoSearchService {
         if (configuredThreadCount > 0) {
             return Math.max(1, configuredThreadCount);
         }
-        // Slight oversubscription helps hide decode / I/O waits and keeps GPU feed steadier.
-        return Math.max(2, Math.min(24, available * 2));
+        // Oversubscription keeps CPU and OpenCL pipeline fed when many videos are analyzed in parallel.
+        return Math.max(2, Math.min(32, available * 2));
     }
 
     private static boolean resolveGpuProcessingEnabled(boolean gpuProcessingRequested) {
@@ -776,6 +786,16 @@ public class VideoSearchService {
                 && lateralTrackScore <= 0.24
                 && motion.crossMotionRatio <= 0.58
                 && motion.residualIntensity >= 0.045;
+    }
+
+    private static boolean looksLikeLowCrossHighTrackVehicle(MotionMetrics motion,
+                                                             double lateralTrackScore,
+                                                             double vehicleColorSignal) {
+        return lateralTrackScore >= 0.65
+                && motion.crossMotionRatio <= 0.38
+                && motion.centerRatio >= 0.40
+                && vehicleColorSignal >= 0.14
+                && motion.residualIntensity >= 0.060;
     }
 
     private static boolean looksLikeColorfulMidLateralRoadVehicle(MotionMetrics motion,
@@ -891,10 +911,19 @@ public class VideoSearchService {
      * Prefer GPU decode when available (macOS: videotoolbox), then safely fall back to CPU.
      * The pixel-wise analysis remains CPU-based in the current implementation.
      */
-    private static void startGrabberWithGpuFallback(FFmpegFrameGrabber grabber) throws FFmpegFrameGrabber.Exception {
+    private static void startGrabberWithGpuFallback(FFmpegFrameGrabber grabber,
+                                                    boolean decodeHwAccelEnabled,
+                                                    int decodeThreadCount) throws FFmpegFrameGrabber.Exception {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
 
-        grabber.setOption("threads", "0");
+        String threadOption = decodeThreadCount <= 0 ? "0" : Integer.toString(Math.max(1, decodeThreadCount));
+        grabber.setOption("threads", threadOption);
+        if (!decodeHwAccelEnabled) {
+            grabber.setOption("hwaccel", "none");
+            grabber.start();
+            return;
+        }
+
         if (os.contains("mac")) {
             grabber.setOption("hwaccel", "videotoolbox");
         } else if (os.contains("win")) {
@@ -1136,9 +1165,10 @@ public class VideoSearchService {
             try {
                 residualDiff = absDiffWithOptionalGpu(prevRoi, currRoi, preferGpu);
                 double residualIntensity = scalarAverage(mean(residualDiff), 3) / 255.0;
-
-                cvtColor(residualDiff, residualGray, COLOR_BGR2GRAY);
-                threshold(residualGray, activeMask, 0.11 * 255.0, 255.0, THRESH_BINARY);
+                if (!buildBinaryMaskWithOptionalGpu(residualDiff, residualGray, activeMask, preferGpu)) {
+                    cvtColor(residualDiff, residualGray, COLOR_BGR2GRAY);
+                    threshold(residualGray, activeMask, 0.11 * 255.0, 255.0, THRESH_BINARY);
+                }
 
                 int roiStartX = (int) Math.round(width * 0.10);
                 int roiEndX = (int) Math.round(width * 0.90);
@@ -1390,6 +1420,31 @@ public class VideoSearchService {
         Mat out = new Mat();
         absdiff(a, b, out);
         return out;
+    }
+
+    private static boolean buildBinaryMaskWithOptionalGpu(Mat residualDiff,
+                                                           Mat residualGray,
+                                                           Mat activeMask,
+                                                           boolean preferGpu) {
+        if (!preferGpu) {
+            return false;
+        }
+        try {
+            UMat uResidual = new UMat();
+            UMat uGray = new UMat();
+            UMat uMask = new UMat();
+            residualDiff.copyTo(uResidual);
+            cvtColor(uResidual, uGray, COLOR_BGR2GRAY);
+            threshold(uGray, uMask, 0.11 * 255.0, 255.0, THRESH_BINARY);
+            uGray.copyTo(residualGray);
+            uMask.copyTo(activeMask);
+            uMask.release();
+            uGray.release();
+            uResidual.release();
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static double scalarAverage(Scalar scalar, int channels) {
