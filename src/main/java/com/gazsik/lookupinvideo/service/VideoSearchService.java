@@ -28,9 +28,12 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -114,33 +117,43 @@ public class VideoSearchService {
         }
 
         String jobId = UUID.randomUUID().toString();
+        int threadCount = Math.min(videoFiles.size(), Runtime.getRuntime().availableProcessors());
         JobProgress progress = new JobProgress();
-        progress.startFile(0, videoFiles.size(), videoFiles.get(0).getFileName().toString());
+        progress.startParallel(videoFiles.size(), threadCount);
         progressMap.put(jobId, progress);
 
         final String q = query == null ? "" : query.trim();
+        final int total = videoFiles.size();
 
-        CompletableFuture.runAsync(() -> {
-            List<SearchOutcome> outcomes = new ArrayList<>();
-            for (int i = 0; i < videoFiles.size(); i++) {
-                Path videoPath = videoFiles.get(i);
-                String fileName = videoPath.getFileName().toString();
-                progress.startFile(i, videoFiles.size(), fileName);
+        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
 
-                String videoId = UUID.randomUUID().toString();
-                videoRegistry.put(videoId, videoPath);
-                try {
-                    SearchOutcome outcome = analyzeVideo(videoId, videoPath, q, fileName, progress);
-                    if (!outcome.getMatches().isEmpty()) {
-                        outcomes.add(outcome);
+        List<CompletableFuture<SearchOutcome>> futures = videoFiles.stream()
+                .map(videoPath -> CompletableFuture.supplyAsync(() -> {
+                    String fileName = videoPath.getFileName().toString();
+                    String videoId = UUID.randomUUID().toString();
+                    videoRegistry.put(videoId, videoPath);
+                    try {
+                        SearchOutcome outcome = analyzeVideo(videoId, videoPath, q, fileName, progress);
+                        progress.fileCompleted(fileName);
+                        return outcome.getMatches().isEmpty() ? null : outcome;
+                    } catch (Exception ex) {
+                        progress.fileCompleted(fileName);
+                        return null;
                     }
-                } catch (Exception ex) {
-                    // egy fájl hibája ne állítsa le az egész keresést
-                }
-            }
-            dirResultMap.put(jobId, outcomes);
-            progress.done(videoFiles.size());
-        });
+                }, pool))
+                .collect(Collectors.toList());
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .thenRun(() -> {
+                    List<SearchOutcome> outcomes = futures.stream()
+                            .map(f -> { try { return f.get(); } catch (Exception e) { return null; } })
+                            .filter(Objects::nonNull)
+                            .sorted(Comparator.comparing(SearchOutcome::getFileName))
+                            .collect(Collectors.toList());
+                    dirResultMap.put(jobId, outcomes);
+                    progress.done(total);
+                    pool.shutdown();
+                });
 
         return jobId;
     }

@@ -1,45 +1,73 @@
 package com.gazsik.lookupinvideo.model;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 public class JobProgress {
 
     public enum Status { RUNNING, DONE, ERROR }
 
-    private volatile int processed = 0;
+    private final AtomicInteger processed = new AtomicInteger(0);
     private volatile int total = 0;
-    private volatile int framePercent = 0;   // aktuális fájlon belüli %
+    private volatile int framePercent = 0;
     private volatile String currentFile = "";
     private volatile Status status = Status.RUNNING;
     private volatile String statusText = "Feldolgozas indul...";
     private volatile String error = null;
+    private volatile boolean parallelMode = false;
+    private volatile int threadCount = 1;
 
-    public int getProcessed()     { return processed; }
-    public int getTotal()         { return total; }
-    public int getFramePercent()  { return framePercent; }
-    public String getCurrentFile(){ return currentFile; }
-    public Status getStatus()     { return status; }
-    public String getStatusText() { return statusText; }
-    public String getError()      { return error; }
+    public int getProcessed()      { return processed.get(); }
+    public int getTotal()          { return total; }
+    public int getFramePercent()   { return parallelMode ? 0 : framePercent; }
+    public String getCurrentFile() { return currentFile; }
+    public Status getStatus()      { return status; }
+    public String getStatusText()  { return statusText; }
+    public String getError()       { return error; }
+    public boolean isParallelMode(){ return parallelMode; }
+    public int getThreadCount()    { return threadCount; }
 
-    /** Összesített %, tartalmazza az aktuális fájlon belüli frame-haladást is. */
+    /** Osszetett % — parhuzamos modban fajlszintu, szekvencialis modban frame-szintu is. */
     public int getPercent() {
         if (total <= 0) return 0;
-        return (int) ((processed * 100L + framePercent) / total);
+        if (parallelMode) {
+            return processed.get() * 100 / total;
+        }
+        return (int) ((processed.get() * 100L + framePercent) / total);
     }
 
-    public void startFile(int processed, int total, String fileName) {
-        this.processed = processed;
+    /** Szekvencialis mod: adott fajl megkezdesekor hivando. */
+    public void startFile(int fileIndex, int total, String fileName) {
+        this.processed.set(fileIndex);
         this.total = total;
         this.currentFile = fileName;
         this.framePercent = 0;
-        this.statusText = String.format("Feldolgozas: %s  (%d / %d)", fileName, processed + 1, total);
+        this.statusText = String.format("Feldolgozas: %s  (%d / %d)", fileName, fileIndex + 1, total);
     }
 
+    /** Parhuzamos mod: a thread pool inditasa elott hivando. */
+    public void startParallel(int total, int threadCount) {
+        this.total = total;
+        this.parallelMode = true;
+        this.threadCount = threadCount;
+        this.statusText = String.format("%d fajl feldolgozasa indul, %d szallon parhuzamosan...", total, threadCount);
+    }
+
+    /** Parhuzamos mod: thread-safe, minden fajl befejezesekor hivando. */
+    public int fileCompleted(String fileName) {
+        int done = processed.incrementAndGet();
+        this.statusText = String.format("%d / %d fajl kesz", done, total);
+        return done;
+    }
+
+    /** Szekvencialis mod: frame-szintu haladas frissitese (parhuzamos modban noop). */
     public void updateFrame(int percent) {
-        this.framePercent = percent;
+        if (!parallelMode) {
+            this.framePercent = percent;
+        }
     }
 
     public void done(int total) {
-        this.processed = total;
+        this.processed.set(total);
         this.total = total;
         this.framePercent = 100;
         this.currentFile = "";
