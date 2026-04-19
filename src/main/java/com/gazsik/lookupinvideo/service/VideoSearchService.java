@@ -2,12 +2,21 @@ package com.gazsik.lookupinvideo.service;
 
 import com.gazsik.lookupinvideo.model.SceneMatch;
 import com.gazsik.lookupinvideo.model.SearchOutcome;
+import org.bytedeco.ffmpeg.global.avutil;
 import org.bytedeco.javacv.FFmpegFrameGrabber;
 import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.Java2DFrameConverter;
+import org.bytedeco.javacv.OpenCVFrameConverter;
+import org.bytedeco.opencv.opencv_core.Mat;
+import org.bytedeco.opencv.opencv_core.Moments;
+import org.bytedeco.opencv.opencv_core.Rect;
+import org.bytedeco.opencv.opencv_core.Scalar;
+import org.bytedeco.opencv.opencv_core.Size;
+import org.bytedeco.opencv.opencv_core.UMat;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import jakarta.annotation.PreDestroy;
 
 import javax.imageio.ImageIO;
 import java.awt.Graphics2D;
@@ -34,8 +43,26 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.bytedeco.javacpp.BytePointer;
+
+import static org.bytedeco.opencv.global.opencv_core.absdiff;
+import static org.bytedeco.opencv.global.opencv_core.countNonZero;
+import static org.bytedeco.opencv.global.opencv_core.haveOpenCL;
+import static org.bytedeco.opencv.global.opencv_core.mean;
+import static org.bytedeco.opencv.global.opencv_core.setUseOpenCL;
+import static org.bytedeco.opencv.global.opencv_core.useOpenCL;
+import static org.bytedeco.opencv.global.opencv_imgproc.COLOR_BGR2GRAY;
+import static org.bytedeco.opencv.global.opencv_imgproc.COLOR_BGRA2BGR;
+import static org.bytedeco.opencv.global.opencv_imgproc.COLOR_GRAY2BGR;
+import static org.bytedeco.opencv.global.opencv_imgproc.INTER_AREA;
+import static org.bytedeco.opencv.global.opencv_imgproc.THRESH_BINARY;
+import static org.bytedeco.opencv.global.opencv_imgproc.cvtColor;
+import static org.bytedeco.opencv.global.opencv_imgproc.moments;
+import static org.bytedeco.opencv.global.opencv_imgproc.resize;
+import static org.bytedeco.opencv.global.opencv_imgproc.threshold;
 
 @Service
 public class VideoSearchService {
@@ -48,9 +75,24 @@ public class VideoSearchService {
     private static final int GLOBAL_SHIFT_MAX_DX = 8;
     private static final int GLOBAL_SHIFT_MAX_DY = 6;
     private static final int GLOBAL_SHIFT_SAMPLE_STRIDE = 4;
-    private static final double ONCOMING_CENTER_RATIO_MIN = 0.58;
-    private static final double ONCOMING_LATERAL_TRAVEL_MAX = 0.012;
-    private static final double ONCOMING_ACTIVE_GROWTH_MIN = 0.003;
+    private static final long MIN_ANALYSIS_TIMEOUT_SECONDS = 60L;
+    private static final double ONCOMING_CENTER_RATIO_MIN = 0.34;
+    private static final double ONCOMING_LATERAL_TRAVEL_MAX = 0.020;
+    private static final double ONCOMING_ACTIVE_GROWTH_MIN = 0.0025;
+    private static final double ONCOMING_TRAVEL_SCORE_MAX = 0.46;
+    private static final double WEAK_LATERAL_CROSS_TRAVEL_MAX = 0.013;
+    private static final double CENTER_APPROACH_CENTER_RATIO_MIN = 0.42;
+    private static final double CENTER_APPROACH_TRAVEL_SCORE_MAX = 0.31;
+    private static final double CENTER_APPROACH_CROSS_TRAVEL_MAX = 0.016;
+    private static final double DEER_TRACK_WINDOW_SECONDS = 1.7;
+    private static final double DEER_TRACK_LATERAL_MIN = 0.020;
+    private static final double DEER_TRACK_LATERAL_STRONG = 0.080;
+    private static final double DEER_TRACK_X_MIN = 0.045;
+    private static final double DEER_TRACK_X_STRONG = 0.200;
+    private static final double ROAD_VEHICLE_COLOR_SIGNAL_MIN = 0.22;
+    private static final double ROAD_VEHICLE_NEUTRAL_SIGNAL_MIN = 0.33;
+    private static final double VEHICLE_COLOR_DOMINANCE_FILTER = 0.18;
+    private static final double NEUTRAL_COLOR_DOMINANCE_FILTER = 0.30;
     private static final List<String> VIDEO_EXTENSIONS =
             List.of(".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg");
 
@@ -59,10 +101,36 @@ public class VideoSearchService {
     private final Map<String, JobProgress> progressMap = new ConcurrentHashMap<>();
     private final Map<String, List<SearchOutcome>> dirResultMap = new ConcurrentHashMap<>();
     private final Map<String, SearchOutcome> singleResultMap = new ConcurrentHashMap<>();
+    private final int analysisThreadCount;
+    private final long analysisTimeoutSeconds;
+    private final ExecutorService analysisExecutor;
+    private final boolean gpuProcessingEnabled;
+    private final String gpuProcessingStatus;
 
-    public VideoSearchService(@Value("${lookup.video.storage-path:uploads}") String storageDir) throws IOException {
+    public VideoSearchService(@Value("${lookup.video.storage-path:uploads}") String storageDir,
+                              @Value("${lookup.video.analysis.max-threads:0}") int configuredAnalysisThreads,
+                              @Value("${lookup.video.analysis.timeout-seconds:900}") long configuredAnalysisTimeoutSeconds,
+                              @Value("${lookup.video.analysis.gpu-processing:true}") boolean gpuProcessingRequested) throws IOException {
+        try {
+            avutil.av_log_set_level(avutil.AV_LOG_ERROR);
+        } catch (Throwable ignored) {
+            // Safe fallback if ffmpeg globals are unavailable at runtime.
+        }
+        ImageIO.setUseCache(false);
         this.storagePath = Paths.get(storageDir).toAbsolutePath().normalize();
         Files.createDirectories(this.storagePath);
+        this.analysisThreadCount = normalizeThreadCount(configuredAnalysisThreads);
+        this.analysisTimeoutSeconds = Math.max(MIN_ANALYSIS_TIMEOUT_SECONDS, configuredAnalysisTimeoutSeconds);
+        this.analysisExecutor = Executors.newFixedThreadPool(this.analysisThreadCount);
+        this.gpuProcessingEnabled = resolveGpuProcessingEnabled(gpuProcessingRequested);
+        this.gpuProcessingStatus = gpuProcessingRequested
+            ? (this.gpuProcessingEnabled ? "OpenCL GPU aktiv" : "GPU nem elerheto, CPU fallback")
+            : "GPU mod kikapcsolva (config)";
+    }
+
+    @PreDestroy
+    public void shutdownExecutors() {
+        analysisExecutor.shutdownNow();
     }
 
     public SearchOutcome storeAndSearch(MultipartFile videoFile, String query) {
@@ -118,7 +186,7 @@ public class VideoSearchService {
             } catch (Exception ex) {
                 progress.error(ex.getMessage());
             }
-        });
+        }, analysisExecutor);
         return jobId;
     }
 
@@ -146,7 +214,7 @@ public class VideoSearchService {
             } catch (Exception ex) {
                 progress.error(ex.getMessage());
             }
-        });
+        }, analysisExecutor);
         return jobId;
     }
 
@@ -186,15 +254,13 @@ public class VideoSearchService {
         }
 
         String jobId = UUID.randomUUID().toString();
-        int threadCount = Math.min(videoFiles.size(), Runtime.getRuntime().availableProcessors());
+        int threadCount = Math.min(videoFiles.size(), analysisThreadCount);
         JobProgress progress = new JobProgress();
         progress.startParallel(videoFiles.size(), threadCount);
         progressMap.put(jobId, progress);
 
         final String q = query == null ? "" : query.trim();
         final int total = videoFiles.size();
-
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
 
         List<CompletableFuture<SearchOutcome>> futures = videoFiles.stream()
                 .map(videoPath -> CompletableFuture.supplyAsync(() -> {
@@ -211,7 +277,7 @@ public class VideoSearchService {
                         progress.fileCompleted(fileName, 0);
                         return null;
                     }
-                }, pool))
+                }, analysisExecutor))
                 .collect(Collectors.toList());
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
@@ -223,7 +289,6 @@ public class VideoSearchService {
                             .collect(Collectors.toList());
                     dirResultMap.put(jobId, outcomes);
                     progress.done(total);
-                    pool.shutdown();
                 });
 
         return jobId;
@@ -250,22 +315,32 @@ public class VideoSearchService {
         List<SceneMatch> matches = new ArrayList<>();
 
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoPath.toFile())) {
-            grabber.start();
+            startGrabberWithGpuFallback(grabber);
 
             long durationUs = Math.max(grabber.getLengthInTime(), 0L);
-            long sampleStepUs = sampleStepForMode(mode);
+            long sampleStepUs = sampleStepForMode(mode, durationUs);
+            long analysisDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(analysisTimeoutSeconds);
             Java2DFrameConverter converter = new Java2DFrameConverter();
-            BufferedImage previousSample = null;
+            OpenCVFrameConverter.ToMat matConverter = new OpenCVFrameConverter.ToMat();
+            Mat previousSampleMat = null;
             double previousResidualCentroidX = Double.NaN;
             double previousResidualCentroidY = Double.NaN;
             double longitudinalAxisX = 0.0;
             double longitudinalAxisY = 1.0;
             double motionEma = 0.0;
             double previousActiveRatio = Double.NaN;
+            List<TrackPoint> deerTrack = new ArrayList<>();
             long nextSampleUs = 0L;
 
             Frame frame;
             while ((frame = grabber.grabImage()) != null) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new IllegalStateException("Az elemzes megszakitva.");
+                }
+                if (System.nanoTime() > analysisDeadlineNanos) {
+                    throw new IllegalStateException("Elemzesi timeout: a feldolgozas tullepte az idolimitet.");
+                }
+
                 long timestampUs = Math.max(grabber.getTimestamp(), 0L);
                 if (progress != null && durationUs > 0) {
                     progress.updateFileFrame(fileName, (int) (timestampUs * 100L / durationUs));
@@ -274,23 +349,27 @@ public class VideoSearchService {
                     continue;
                 }
 
-                BufferedImage image = converter.convert(frame);
-                if (image == null) {
+                Mat frameMat = matConverter.convert(frame);
+                if (frameMat == null || frameMat.empty()) {
                     continue;
                 }
 
-                BufferedImage scaled = scale(image, 320);
+                Mat scaledMat = scale(frameMat, 320);
+                if (scaledMat == null || scaledMat.empty()) {
+                    continue;
+                }
+                ColorStats colorStats = computeColorStats(scaledMat);
 
-                MotionMetrics motionMetrics = previousSample == null
+                MotionMetrics motionMetrics = previousSampleMat == null
                         ? MotionMetrics.empty()
-                    : computeMotionMetrics(
-                    previousSample,
-                    scaled,
-                    previousResidualCentroidX,
-                    previousResidualCentroidY,
-                    longitudinalAxisX,
-                    longitudinalAxisY
-                );
+                        : computeMotionMetricsWithBackend(
+                                previousSampleMat,
+                                scaledMat,
+                                previousResidualCentroidX,
+                                previousResidualCentroidY,
+                                longitudinalAxisX,
+                                longitudinalAxisY
+                        );
                 previousResidualCentroidX = motionMetrics.centroidX;
                 previousResidualCentroidY = motionMetrics.centroidY;
 
@@ -317,13 +396,31 @@ public class VideoSearchService {
                         ? 0.0
                         : Math.max(0.0, motionMetrics.activeRatio - previousActiveRatio);
                 previousActiveRatio = motionMetrics.activeRatio;
-                previousSample = scaled;
+
+                double axisNormNow = Math.hypot(longitudinalAxisX, longitudinalAxisY);
+                double axisXNow = axisNormNow < 1e-6 ? 0.0 : longitudinalAxisX / axisNormNow;
+                double axisYNow = axisNormNow < 1e-6 ? 1.0 : longitudinalAxisY / axisNormNow;
+                double lateralTrackScore = 0.0;
+                if (mode == QueryMode.DEER) {
+                    lateralTrackScore = computeLateralTrackScore(
+                        deerTrack,
+                        timestampUs / 1_000_000.0,
+                        motionMetrics,
+                        axisXNow,
+                        axisYNow
+                    );
+                }
+                if (previousSampleMat != null) {
+                    previousSampleMat.release();
+                }
+                previousSampleMat = scaledMat.clone();
+                scaledMat.release();
 
                 double score;
                 String reason;
 
                 if (mode == QueryMode.COLOR) {
-                    double colorDominance = computeColorDominance(scaled, colorQuery);
+                    double colorDominance = colorStats.dominance(colorQuery);
                     double colorMotionBoost = clamp((motionMetrics.residualIntensity - 0.010) / 0.070, 0.0, 1.0);
                     score = clamp(colorDominance * 0.78 + colorMotionBoost * 0.22, 0.0, 1.0);
                     reason = String.format(
@@ -334,27 +431,48 @@ public class VideoSearchService {
                             colorMotionBoost * 100
                     );
                 } else if (mode == QueryMode.DEER) {
-                    if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)) {
+                    double vehicleColorSignal = Math.max(colorStats.redDominance, colorStats.blueDominance);
+                    double neutralSignal = colorStats.neutralDominance;
+                    if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
+                        || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)
+                        || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
+                        || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
+                        || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal)) {
                         continue;
                     }
-                    score = computeDeerScore(motionMetrics, burstScore, activeGrowth);
+                    score = computeDeerScore(
+                            motionMetrics,
+                            burstScore,
+                            activeGrowth,
+                            lateralTrackScore,
+                            vehicleColorSignal,
+                            colorStats.neutralDominance
+                    );
                     reason = String.format(
                             Locale.ROOT,
-                            "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%%",
+                        "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%% | Oldalpalya: %.1f%% | Autoszin: %.1f%%",
                             score * 100,
                             motionMetrics.crossMotionRatio * 100,
                             motionMetrics.residualIntensity * 100,
-                            motionMetrics.centerRatio * 100
+                            motionMetrics.centerRatio * 100,
+                            lateralTrackScore * 100,
+                            vehicleColorSignal * 100
                     );
                 } else {
                     score = motionMetrics.intensity;
                     reason = String.format(Locale.ROOT, "Mozgas-intenzitas: %.1f%%", motionMetrics.intensity * 100);
                 }
 
+                nextSampleUs = advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
+
                 if (!isMatch(mode, score)) {
                     continue;
                 }
 
+                BufferedImage image = converter.convert(frame);
+                if (image == null) {
+                    continue;
+                }
                 String preview = createPreviewDataUrl(image);
                 double timestampSeconds = timestampUs / 1_000_000.0;
                 if (mode == QueryMode.DEER) {
@@ -363,13 +481,13 @@ public class VideoSearchService {
                 }
                 matches.add(new SceneMatch(timestampSeconds, score, reason, preview));
 
-                do {
-                    nextSampleUs += sampleStepUs;
-                } while (timestampUs >= nextSampleUs);
-
                 if (durationUs > 0 && timestampUs >= durationUs) {
                     break;
                 }
+            }
+
+            if (previousSampleMat != null) {
+                previousSampleMat.release();
             }
 
             grabber.stop();
@@ -396,6 +514,7 @@ public class VideoSearchService {
                 modeLabel = "Demo: mozgasalapu jelenet-kereses";
                 note = "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
             }
+            note = note + " | " + gpuProcessingStatus;
 
             return new SearchOutcome(videoId, query, modeLabel, note, durationUs / 1_000_000.0, matches, fileName);
         } catch (Exception ex) {
@@ -429,14 +548,23 @@ public class VideoSearchService {
         return new ColorQuery(wantsRed, wantsGreen, wantsBlue);
     }
 
-    private static long sampleStepForMode(QueryMode mode) {
-        return mode == QueryMode.DEER ? DEER_SAMPLE_STEP_US : DEFAULT_SAMPLE_STEP_US;
+    private static long sampleStepForMode(QueryMode mode, long durationUs) {
+        if (mode != QueryMode.DEER) {
+            return DEFAULT_SAMPLE_STEP_US;
+        }
+        if (durationUs >= 360_000_000L) {
+            return 500_000L;
+        }
+        if (durationUs >= 180_000_000L) {
+            return 400_000L;
+        }
+        return DEER_SAMPLE_STEP_US;
     }
 
     private static boolean isMatch(QueryMode mode, double score) {
         return switch (mode) {
             case COLOR -> score >= 0.14;
-            case DEER -> score >= 0.14;
+            case DEER -> score >= 0.16;
             case MOTION -> score >= 0.18;
         };
     }
@@ -453,7 +581,7 @@ public class VideoSearchService {
         representatives.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
 
         double topScore = representatives.get(0).getConfidence();
-        double dynamicThreshold = clamp(topScore * 0.55, 0.14, 0.34);
+        double dynamicThreshold = clamp(topScore * 0.60, 0.16, 0.36);
 
         List<SceneMatch> filtered = new ArrayList<>();
         for (SceneMatch candidate : representatives) {
@@ -528,45 +656,205 @@ public class VideoSearchService {
         return false;
     }
 
-    private static double computeDeerScore(MotionMetrics motion, double burstScore, double activeGrowth) {
+    private static long advanceSampleCursor(long timestampUs, long nextSampleUs, long sampleStepUs) {
+        long step = Math.max(1L, sampleStepUs);
+        long cursor = nextSampleUs;
+        do {
+            cursor += step;
+        } while (timestampUs >= cursor);
+        return cursor;
+    }
+
+    private static int normalizeThreadCount(int configuredThreadCount) {
+        int available = Math.max(1, Runtime.getRuntime().availableProcessors());
+        if (configuredThreadCount > 0) {
+            return Math.max(1, configuredThreadCount);
+        }
+        return Math.max(2, available);
+    }
+
+    private static boolean resolveGpuProcessingEnabled(boolean gpuProcessingRequested) {
+        if (!gpuProcessingRequested) {
+            return false;
+        }
+        try {
+            boolean openClAvailable = haveOpenCL();
+            setUseOpenCL(openClAvailable);
+            return openClAvailable && useOpenCL();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static double computeDeerScore(MotionMetrics motion,
+                                           double burstScore,
+                                           double activeGrowth,
+                                           double lateralTrackScore,
+                                           double vehicleColorSignal,
+                                           double neutralDominance) {
         double compactness = motion.activeRatio <= 0.0001
                 ? 0.0
             : clamp((motion.residualIntensity / motion.activeRatio) / 3.7, 0.0, 1.0);
         double foregroundIsolation = 1.0 - clamp(motion.activeRatio / 0.14, 0.0, 1.0);
-        double residualGate = clamp((motion.residualIntensity - 0.018) / 0.072, 0.0, 1.0);
-        double lateralTravelGate = clamp((motion.crossTravel - 0.004) / 0.034, 0.0, 1.0);
+        double residualGate = clamp((motion.residualIntensity - 0.020) / 0.070, 0.0, 1.0);
+        double lateralTravelGate = clamp((motion.crossTravel - 0.008) / 0.032, 0.0, 1.0);
         double directionalConfidence = clamp(
-                ((motion.crossMotionRatio * 0.55) + (lateralTravelGate * 0.45))
+            ((motion.crossMotionRatio * 0.28)
+                + (lateralTravelGate * 0.33)
+                + (lateralTrackScore * 0.39))
                         * motion.travelScore
                         * residualGate,
                 0.0,
                 1.0
         );
-        double burstGate = clamp(burstScore / 0.075, 0.0, 1.0);
-        double oncomingPenalty = clamp((motion.centerRatio - ONCOMING_CENTER_RATIO_MIN) / 0.30, 0.0, 1.0)
-                * clamp((ONCOMING_LATERAL_TRAVEL_MAX - motion.crossTravel) / ONCOMING_LATERAL_TRAVEL_MAX, 0.0, 1.0)
-                * clamp((motion.parallelTravel - 0.004) / 0.030, 0.0, 1.0)
-                * clamp((activeGrowth - ONCOMING_ACTIVE_GROWTH_MIN) / 0.018, 0.0, 1.0);
+        double burstGate = clamp(burstScore / 0.070, 0.0, 1.0);
+
+        double centerPenalty = clamp((motion.centerRatio - ONCOMING_CENTER_RATIO_MIN) / 0.45, 0.0, 1.0);
+        double growthPenalty = clamp((activeGrowth - ONCOMING_ACTIVE_GROWTH_MIN) / 0.018, 0.0, 1.0);
+        double lowCrossPenalty = clamp((ONCOMING_LATERAL_TRAVEL_MAX - motion.crossTravel) / ONCOMING_LATERAL_TRAVEL_MAX, 0.0, 1.0);
+        double lowTravelPenalty = clamp((ONCOMING_TRAVEL_SCORE_MAX - motion.travelScore) / ONCOMING_TRAVEL_SCORE_MAX, 0.0, 1.0);
+        double oncomingPenalty = (centerPenalty * 0.35)
+                + (growthPenalty * 0.30)
+                + (lowCrossPenalty * 0.20)
+                + (lowTravelPenalty * 0.15);
+        oncomingPenalty *= clamp((motion.residualIntensity - 0.035) / 0.070, 0.0, 1.0);
+        double colorPenalty = clamp((vehicleColorSignal - 0.055) / 0.20, 0.0, 1.0)
+            * clamp((motion.centerRatio - 0.32) / 0.50, 0.0, 1.0)
+            * clamp((0.36 - lateralTrackScore) / 0.36, 0.0, 1.0);
+        double neutralPenalty = clamp((neutralDominance - 0.18) / 0.30, 0.0, 1.0)
+            * clamp((motion.centerRatio - 0.30) / 0.55, 0.0, 1.0)
+            * clamp((0.42 - lateralTrackScore) / 0.42, 0.0, 1.0);
 
         double combined =
-            directionalConfidence * 0.52 +
-            residualGate * 0.20 +
+            directionalConfidence * 0.63 +
+            residualGate * 0.10 +
             burstGate * 0.15 +
             foregroundIsolation * 0.06 +
-            compactness * 0.07;
+            compactness * 0.06;
 
-        combined -= oncomingPenalty * 0.28;
+        combined -= oncomingPenalty * 0.38;
+        combined -= colorPenalty * 0.22;
+        combined -= neutralPenalty * 0.14;
 
         return clamp(combined, 0.0, 1.0);
     }
 
     private static boolean looksLikeOncomingVehicle(MotionMetrics motion, double activeGrowth) {
         boolean centerLocked = motion.centerRatio >= ONCOMING_CENTER_RATIO_MIN
-                && Math.abs(motion.centroidX - 0.5) <= 0.18;
+                && Math.abs(motion.centroidX - 0.5) <= 0.26;
         boolean lowLateralTravel = motion.crossTravel <= ONCOMING_LATERAL_TRAVEL_MAX;
-        boolean forwardDominant = motion.parallelTravel >= (motion.crossTravel * 0.9);
-        boolean growingObject = activeGrowth >= ONCOMING_ACTIVE_GROWTH_MIN || motion.activeRatio >= 0.065;
-        return centerLocked && lowLateralTravel && forwardDominant && growingObject;
+        boolean slowLateralCentroid = motion.travelScore <= ONCOMING_TRAVEL_SCORE_MAX;
+        boolean growingObject = activeGrowth >= ONCOMING_ACTIVE_GROWTH_MIN || motion.activeRatio >= 0.055;
+        boolean sufficientlyStrong = motion.residualIntensity >= 0.045;
+        return centerLocked && growingObject && sufficientlyStrong && (lowLateralTravel || slowLateralCentroid);
+    }
+
+    private static boolean looksLikePseudoLateralGrowth(MotionMetrics motion, double activeGrowth, double lateralTrackScore) {
+        return motion.crossMotionRatio >= 0.55
+                && motion.crossTravel <= WEAK_LATERAL_CROSS_TRAVEL_MAX
+                && motion.travelScore <= ONCOMING_TRAVEL_SCORE_MAX
+                && lateralTrackScore < 0.30
+                && (activeGrowth >= ONCOMING_ACTIVE_GROWTH_MIN || motion.centerRatio >= 0.38);
+    }
+
+    private static boolean looksLikeCenterApproach(MotionMetrics motion, double lateralTrackScore) {
+        return motion.centerRatio >= CENTER_APPROACH_CENTER_RATIO_MIN
+                && motion.travelScore <= CENTER_APPROACH_TRAVEL_SCORE_MAX
+                && motion.crossTravel <= CENTER_APPROACH_CROSS_TRAVEL_MAX
+                && lateralTrackScore < 0.35
+                && motion.residualIntensity >= 0.032;
+    }
+
+    private static boolean looksLikeVehicleColorBlob(MotionMetrics motion, ColorStats colorStats, double lateralTrackScore) {
+        double vehicleColor = Math.max(colorStats.redDominance, colorStats.blueDominance);
+        boolean centerish = motion.centerRatio >= 0.34;
+        boolean weakLateral = lateralTrackScore < 0.35 && motion.crossTravel <= 0.018;
+        boolean vividVehicle = vehicleColor >= VEHICLE_COLOR_DOMINANCE_FILTER;
+        boolean neutralVehicle = colorStats.neutralDominance >= NEUTRAL_COLOR_DOMINANCE_FILTER;
+        return centerish && weakLateral && (vividVehicle || neutralVehicle);
+    }
+
+    private static boolean looksLikeRoadVehicleProfile(MotionMetrics motion,
+                                                       double lateralTrackScore,
+                                                       double vehicleColorSignal,
+                                                       double neutralSignal) {
+        boolean roadLikeMotion = motion.centerRatio >= 0.34 && motion.residualIntensity >= 0.030;
+        boolean colorfulVehicle = vehicleColorSignal >= ROAD_VEHICLE_COLOR_SIGNAL_MIN && lateralTrackScore >= 0.70;
+        boolean neutralVehicle = neutralSignal >= ROAD_VEHICLE_NEUTRAL_SIGNAL_MIN && lateralTrackScore < 0.80;
+        return roadLikeMotion && (colorfulVehicle || neutralVehicle);
+    }
+
+    private static double computeLateralTrackScore(List<TrackPoint> deerTrack,
+                                                   double timestampSeconds,
+                                                   MotionMetrics motion,
+                                                   double axisX,
+                                                   double axisY) {
+        if (motion.activeRatio < 0.008 || motion.residualIntensity < 0.018) {
+            return 0.0;
+        }
+
+        deerTrack.add(new TrackPoint(timestampSeconds, motion.centroidX, motion.centroidY));
+        while (!deerTrack.isEmpty() && timestampSeconds - deerTrack.get(0).timestampSeconds > DEER_TRACK_WINDOW_SECONDS) {
+            deerTrack.remove(0);
+        }
+
+        if (deerTrack.size() < 2) {
+            return 0.0;
+        }
+
+        TrackPoint first = deerTrack.get(0);
+        double dx = motion.centroidX - first.centroidX;
+        double dy = motion.centroidY - first.centroidY;
+        double lateralDistance = Math.abs(dx * (-axisY) + dy * axisX);
+        double lateralScore = clamp(
+                (lateralDistance - DEER_TRACK_LATERAL_MIN) / (DEER_TRACK_LATERAL_STRONG - DEER_TRACK_LATERAL_MIN),
+                0.0,
+                1.0
+        );
+        double horizontalDistance = Math.abs(dx);
+        double horizontalScore = clamp(
+            (horizontalDistance - DEER_TRACK_X_MIN) / (DEER_TRACK_X_STRONG - DEER_TRACK_X_MIN),
+            0.0,
+            1.0
+        );
+
+        // True crossing should be both axis-lateral and visibly horizontal in image space.
+        double blended = Math.sqrt(lateralScore * horizontalScore);
+        if (motion.centerRatio >= 0.45 && horizontalScore < 0.35) {
+            blended *= 0.55;
+        }
+        return clamp(blended, 0.0, 1.0);
+    }
+
+    /**
+     * Prefer GPU decode when available (macOS: videotoolbox), then safely fall back to CPU.
+     * The pixel-wise analysis remains CPU-based in the current implementation.
+     */
+    private static void startGrabberWithGpuFallback(FFmpegFrameGrabber grabber) throws FFmpegFrameGrabber.Exception {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+
+        grabber.setOption("threads", "0");
+        if (os.contains("mac")) {
+            grabber.setOption("hwaccel", "videotoolbox");
+        } else if (os.contains("win")) {
+            grabber.setOption("hwaccel", "d3d11va");
+        } else {
+            grabber.setOption("hwaccel", "auto");
+        }
+
+        try {
+            grabber.start();
+            return;
+        } catch (FFmpegFrameGrabber.Exception ignored) {
+            try {
+                grabber.stop();
+            } catch (Exception ignoredStop) {
+                // no-op
+            }
+        }
+
+        grabber.setOption("hwaccel", "none");
+        grabber.start();
     }
 
     private static double clamp(double value, double min, double max) {
@@ -605,20 +893,67 @@ public class VideoSearchService {
         return scaled;
     }
 
-    private static double computeColorDominance(BufferedImage image, ColorQuery colorQuery) {
-        int width = image.getWidth();
-        int height = image.getHeight();
+    private static Mat scale(Mat source, int maxWidth) {
+        if (source == null || source.empty()) {
+            return new Mat();
+        }
+        Mat bgrSource = ensureBgr(source);
+        int width = bgrSource.cols();
+        int height = bgrSource.rows();
+        int targetWidth = Math.min(maxWidth, width);
+        int targetHeight = Math.max(1, (int) Math.round((double) height * targetWidth / width));
+
+        Mat scaled = new Mat();
+        resize(bgrSource, scaled, new Size(targetWidth, targetHeight), 0, 0, INTER_AREA);
+        if (bgrSource != source) {
+            bgrSource.release();
+        }
+        return scaled;
+    }
+
+    private static Mat ensureBgr(Mat source) {
+        if (source == null || source.empty()) {
+            return new Mat();
+        }
+        if (source.channels() == 3) {
+            return source;
+        }
+        Mat converted = new Mat();
+        if (source.channels() == 4) {
+            cvtColor(source, converted, COLOR_BGRA2BGR);
+            return converted;
+        }
+        if (source.channels() == 1) {
+            cvtColor(source, converted, COLOR_GRAY2BGR);
+            return converted;
+        }
+        source.copyTo(converted);
+        return converted;
+    }
+
+    private static ColorStats computeColorStats(Mat image) {
+        Mat bgr = ensureBgr(image);
+        if (bgr == null || bgr.empty() || bgr.data() == null) {
+            return new ColorStats(0.0, 0.0, 0.0, 0.0);
+        }
+
+        int width = bgr.cols();
+        int height = bgr.rows();
+        long rowStep = bgr.step();
+        BytePointer data = bgr.data();
         int total = 0;
         int redDominant = 0;
         int greenDominant = 0;
         int blueDominant = 0;
+        int neutralDominant = 0;
 
         for (int y = 0; y < height; y += 2) {
+            long rowOffset = y * rowStep;
             for (int x = 0; x < width; x += 2) {
-                int rgb = image.getRGB(x, y);
-                int r = (rgb >> 16) & 0xFF;
-                int g = (rgb >> 8) & 0xFF;
-                int b = rgb & 0xFF;
+                long px = rowOffset + (long) x * 3L;
+                int b = data.get(px) & 0xFF;
+                int g = data.get(px + 1) & 0xFF;
+                int r = data.get(px + 2) & 0xFF;
 
                 int max = Math.max(r, Math.max(g, b));
                 int min = Math.min(r, Math.min(g, b));
@@ -633,24 +968,395 @@ public class VideoSearchService {
                 if (b > 80 && saturation > 28 && b > (int) (r * 1.12) && b > (int) (g * 1.12)) {
                     blueDominant++;
                 }
+                if (saturation < 20 && max > 95) {
+                    neutralDominant++;
+                }
                 total++;
             }
         }
 
+        if (bgr != image) {
+            bgr.release();
+        }
+
         if (total == 0) {
-            return 0.0;
+            return new ColorStats(0.0, 0.0, 0.0, 0.0);
         }
-        double best = 0.0;
-        if (colorQuery.wantsRed) {
-            best = Math.max(best, redDominant / (double) total);
+        return new ColorStats(
+                redDominant / (double) total,
+                greenDominant / (double) total,
+                blueDominant / (double) total,
+                neutralDominant / (double) total
+        );
+    }
+
+    private MotionMetrics computeMotionMetricsWithBackend(Mat previousMat,
+                                                          Mat currentMat,
+                                                          double previousCentroidX,
+                                                          double previousCentroidY,
+                                                          double longitudinalAxisX,
+                                                          double longitudinalAxisY) {
+        try {
+            return computeMotionMetricsOpenCl(
+                    previousMat,
+                    currentMat,
+                    previousCentroidX,
+                    previousCentroidY,
+                    longitudinalAxisX,
+                    longitudinalAxisY,
+                    gpuProcessingEnabled
+            );
+        } catch (Throwable ignored) {
+            return computeMotionMetricsOpenCl(
+                    previousMat,
+                    currentMat,
+                    previousCentroidX,
+                    previousCentroidY,
+                    longitudinalAxisX,
+                    longitudinalAxisY,
+                    false
+            );
         }
-        if (colorQuery.wantsGreen) {
-            best = Math.max(best, greenDominant / (double) total);
+    }
+
+    private static MotionMetrics computeMotionMetricsOpenCl(Mat previous,
+                                                            Mat current,
+                                                            double previousCentroidX,
+                                                            double previousCentroidY,
+                                                            double longitudinalAxisX,
+                                                            double longitudinalAxisY,
+                                                            boolean preferGpu) {
+        int width = Math.min(previous.cols(), current.cols());
+        int height = Math.min(previous.rows(), current.rows());
+        if (width <= 0 || height <= 0) {
+            return MotionMetrics.empty();
         }
-        if (colorQuery.wantsBlue) {
-            best = Math.max(best, blueDominant / (double) total);
+
+        Rect sharedRect = new Rect(0, 0, width, height);
+        Mat previousShared = new Mat(previous, sharedRect);
+        Mat currentShared = new Mat(current, sharedRect);
+        try {
+            GlobalShift shift = estimateGlobalShiftOpenCl(previousShared, currentShared, width, height);
+            double intensity = rgbDiffMean01(previousShared, currentShared, preferGpu);
+
+            int startX = Math.max(0, -shift.dx);
+            int endX = Math.min(width, width - shift.dx);
+            int startY = Math.max(0, -shift.dy);
+            int endY = Math.min(height, height - shift.dy);
+            int overlapWidth = endX - startX;
+            int overlapHeight = endY - startY;
+
+            if (overlapWidth < 8 || overlapHeight < 8) {
+                return new MotionMetrics(
+                        intensity,
+                        0.0,
+                        0.0,
+                        0.0,
+                        Double.isNaN(previousCentroidX) ? 0.5 : previousCentroidX,
+                        Double.isNaN(previousCentroidY) ? 0.68 : previousCentroidY,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        shift.dx,
+                        shift.dy
+                );
+            }
+
+            Rect prevOverlap = new Rect(startX, startY, overlapWidth, overlapHeight);
+            Rect currOverlap = new Rect(startX + shift.dx, startY + shift.dy, overlapWidth, overlapHeight);
+            Mat prevRoi = new Mat(previousShared, prevOverlap);
+            Mat currRoi = new Mat(currentShared, currOverlap);
+            Mat residualDiff = null;
+            Mat residualGray = new Mat();
+            Mat activeMask = new Mat();
+            Mat motionMask = null;
+            Mat centerMask = null;
+            try {
+                residualDiff = absDiffWithOptionalGpu(prevRoi, currRoi, preferGpu);
+                double residualIntensity = scalarAverage(mean(residualDiff), 3) / 255.0;
+
+                cvtColor(residualDiff, residualGray, COLOR_BGR2GRAY);
+                threshold(residualGray, activeMask, 0.11 * 255.0, 255.0, THRESH_BINARY);
+
+                int roiStartX = (int) Math.round(width * 0.10);
+                int roiEndX = (int) Math.round(width * 0.90);
+                int roiStartY = (int) Math.round(height * 0.22);
+                int roiEndY = (int) Math.round(height * 0.95);
+
+                int centerStartX = (int) Math.round(width * 0.26);
+                int centerEndX = (int) Math.round(width * 0.74);
+                int centerStartY = (int) Math.round(height * 0.25);
+                int centerEndY = (int) Math.round(height * 0.90);
+
+                Rect motionRect = intersectRect(
+                        startX,
+                        startY,
+                        endX,
+                        endY,
+                        roiStartX,
+                        roiStartY,
+                        roiEndX + 1,
+                        roiEndY + 1,
+                        -startX,
+                        -startY
+                );
+
+                if (motionRect == null || motionRect.width() <= 0 || motionRect.height() <= 0) {
+                    return new MotionMetrics(
+                            intensity,
+                            residualIntensity,
+                            0.0,
+                            0.0,
+                            Double.isNaN(previousCentroidX) ? 0.5 : previousCentroidX,
+                            Double.isNaN(previousCentroidY) ? 0.68 : previousCentroidY,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            shift.dx,
+                            shift.dy
+                    );
+                }
+
+                motionMask = new Mat(activeMask, motionRect);
+                int active = countNonZero(motionMask);
+                int roiSamples = motionRect.width() * motionRect.height();
+                double activeRatio = active / (double) Math.max(1, roiSamples);
+
+                double centroidX;
+                double centroidY;
+                if (active <= 0) {
+                    centroidX = Double.isNaN(previousCentroidX) ? 0.5 : previousCentroidX;
+                    centroidY = Double.isNaN(previousCentroidY) ? 0.68 : previousCentroidY;
+                } else {
+                    Moments maskMoments = moments(motionMask, true);
+                    if (Math.abs(maskMoments.m00()) <= 1e-6) {
+                        centroidX = Double.isNaN(previousCentroidX) ? 0.5 : previousCentroidX;
+                        centroidY = Double.isNaN(previousCentroidY) ? 0.68 : previousCentroidY;
+                    } else {
+                        double localCx = maskMoments.m10() / maskMoments.m00();
+                        double localCy = maskMoments.m01() / maskMoments.m00();
+                        double globalPx = startX + motionRect.x() + localCx;
+                        double globalPy = startY + motionRect.y() + localCy;
+                        centroidX = clamp(globalPx / Math.max(1.0, (double) (width - 1)), 0.0, 1.0);
+                        centroidY = clamp(globalPy / Math.max(1.0, (double) (height - 1)), 0.0, 1.0);
+                    }
+                }
+
+                Rect centerRect = intersectRect(
+                        startX,
+                        startY,
+                        endX,
+                        endY,
+                        centerStartX,
+                        centerStartY,
+                        centerEndX + 1,
+                        centerEndY + 1,
+                        -startX,
+                        -startY
+                );
+                int centerActive = 0;
+                if (centerRect != null && centerRect.width() > 0 && centerRect.height() > 0) {
+                    centerMask = new Mat(activeMask, centerRect);
+                    centerActive = countNonZero(centerMask);
+                }
+                double centerRatio = active <= 0 ? 0.0 : centerActive / (double) active;
+
+                double objectShiftX = Double.isNaN(previousCentroidX) ? 0.0 : centroidX - previousCentroidX;
+                double objectShiftY = Double.isNaN(previousCentroidY) ? 0.0 : centroidY - previousCentroidY;
+                double objectSpeed = Math.hypot(objectShiftX, objectShiftY);
+
+                double axisNorm = Math.hypot(longitudinalAxisX, longitudinalAxisY);
+                double axisX = axisNorm < 1e-6 ? 0.0 : longitudinalAxisX / axisNorm;
+                double axisY = axisNorm < 1e-6 ? 1.0 : longitudinalAxisY / axisNorm;
+
+                double crossMotionRatio = 0.0;
+                double crossTravel = 0.0;
+                double parallelTravel = 0.0;
+                if (!Double.isNaN(previousCentroidX) && !Double.isNaN(previousCentroidY) && objectSpeed > 1e-6) {
+                    parallelTravel = Math.abs(objectShiftX * axisX + objectShiftY * axisY);
+                    crossTravel = Math.abs(objectShiftX * (-axisY) + objectShiftY * axisX);
+                    crossMotionRatio = crossTravel / (crossTravel + parallelTravel + 1e-6);
+                }
+
+                double travelScore = clamp(objectSpeed * 7.0, 0.0, 1.0);
+
+                return new MotionMetrics(
+                        intensity,
+                        residualIntensity,
+                        activeRatio,
+                        centerRatio,
+                        centroidX,
+                        centroidY,
+                        crossMotionRatio,
+                        crossTravel,
+                        parallelTravel,
+                        travelScore,
+                        shift.dx,
+                        shift.dy
+                );
+            } finally {
+                if (centerMask != null) {
+                    centerMask.release();
+                }
+                if (motionMask != null) {
+                    motionMask.release();
+                }
+                activeMask.release();
+                residualGray.release();
+                if (residualDiff != null) {
+                    residualDiff.release();
+                }
+                currRoi.release();
+                prevRoi.release();
+            }
+        } finally {
+            currentShared.release();
+            previousShared.release();
         }
-        return best;
+    }
+
+    private static GlobalShift estimateGlobalShiftOpenCl(Mat previous,
+                                                         Mat current,
+                                                         int width,
+                                                         int height) {
+        Mat previousGray = new Mat();
+        Mat currentGray = new Mat();
+        try {
+            cvtColor(previous, previousGray, COLOR_BGR2GRAY);
+            cvtColor(current, currentGray, COLOR_BGR2GRAY);
+
+            int bestDx = 0;
+            int bestDy = 0;
+            double bestError = Double.MAX_VALUE;
+
+            for (int dy = -GLOBAL_SHIFT_MAX_DY; dy <= GLOBAL_SHIFT_MAX_DY; dy++) {
+                for (int dx = -GLOBAL_SHIFT_MAX_DX; dx <= GLOBAL_SHIFT_MAX_DX; dx++) {
+                    int startX = Math.max(0, -dx);
+                    int endX = Math.min(width, width - dx);
+                    int startY = Math.max(0, -dy);
+                    int endY = Math.min(height, height - dy);
+
+                    int overlapWidth = endX - startX;
+                    int overlapHeight = endY - startY;
+                    if (overlapWidth < 24 || overlapHeight < 16) {
+                        continue;
+                    }
+
+                    Rect prevRect = new Rect(startX, startY, overlapWidth, overlapHeight);
+                    Rect currRect = new Rect(startX + dx, startY + dy, overlapWidth, overlapHeight);
+                    Mat prevRoi = new Mat(previousGray, prevRect);
+                    Mat currRoi = new Mat(currentGray, currRect);
+                    try {
+                        // In this tight nested loop GPU upload/download overhead is expensive, so keep it CPU-fast.
+                        double error = grayDiffMean(prevRoi, currRoi, false);
+                        error += Math.hypot(dx, dy) * 0.15;
+
+                        if (error < bestError) {
+                            bestError = error;
+                            bestDx = dx;
+                            bestDy = dy;
+                        }
+                    } finally {
+                        currRoi.release();
+                        prevRoi.release();
+                    }
+                }
+            }
+
+            return new GlobalShift(bestDx, bestDy);
+        } finally {
+            currentGray.release();
+            previousGray.release();
+        }
+    }
+
+    private static double rgbDiffMean01(Mat a, Mat b, boolean preferGpu) {
+        Scalar diffMean = meanAbsDiff(a, b, preferGpu);
+        return scalarAverage(diffMean, 3) / 255.0;
+    }
+
+    private static double grayDiffMean(Mat a, Mat b, boolean preferGpu) {
+        Scalar diffMean = meanAbsDiff(a, b, preferGpu);
+        return diffMean.get(0);
+    }
+
+    private static Scalar meanAbsDiff(Mat a, Mat b, boolean preferGpu) {
+        if (preferGpu) {
+            try {
+                UMat ua = new UMat();
+                UMat ub = new UMat();
+                UMat ud = new UMat();
+                a.copyTo(ua);
+                b.copyTo(ub);
+                absdiff(ua, ub, ud);
+                Scalar s = mean(ud);
+                ua.release();
+                ub.release();
+                ud.release();
+                return s;
+            } catch (Throwable ignored) {
+                // Fall through to CPU path.
+            }
+        }
+        Mat diff = new Mat();
+        absdiff(a, b, diff);
+        Scalar s = mean(diff);
+        diff.release();
+        return s;
+    }
+
+    private static Mat absDiffWithOptionalGpu(Mat a, Mat b, boolean preferGpu) {
+        if (preferGpu) {
+            try {
+                UMat ua = new UMat();
+                UMat ub = new UMat();
+                UMat ud = new UMat();
+                a.copyTo(ua);
+                b.copyTo(ub);
+                absdiff(ua, ub, ud);
+                Mat out = new Mat();
+                ud.copyTo(out);
+                ua.release();
+                ub.release();
+                ud.release();
+                return out;
+            } catch (Throwable ignored) {
+                // Fall through to CPU path.
+            }
+        }
+        Mat out = new Mat();
+        absdiff(a, b, out);
+        return out;
+    }
+
+    private static double scalarAverage(Scalar scalar, int channels) {
+        double sum = 0.0;
+        for (int i = 0; i < channels; i++) {
+            sum += scalar.get(i);
+        }
+        return sum / channels;
+    }
+
+    private static Rect intersectRect(int aStartX,
+                                      int aStartY,
+                                      int aEndX,
+                                      int aEndY,
+                                      int bStartX,
+                                      int bStartY,
+                                      int bEndX,
+                                      int bEndY,
+                                      int offsetX,
+                                      int offsetY) {
+        int x1 = Math.max(aStartX, bStartX);
+        int y1 = Math.max(aStartY, bStartY);
+        int x2 = Math.min(aEndX, bEndX);
+        int y2 = Math.min(aEndY, bEndY);
+        if (x2 <= x1 || y2 <= y1) {
+            return null;
+        }
+        return new Rect(x1 + offsetX, y1 + offsetY, x2 - x1, y2 - y1);
     }
 
     private static MotionMetrics computeMotionMetrics(BufferedImage previous,
@@ -874,6 +1580,49 @@ public class VideoSearchService {
                 names.add("kek");
             }
             return String.join("/", names);
+        }
+    }
+
+    private static final class ColorStats {
+        private final double redDominance;
+        private final double greenDominance;
+        private final double blueDominance;
+        private final double neutralDominance;
+
+        private ColorStats(double redDominance,
+                           double greenDominance,
+                           double blueDominance,
+                           double neutralDominance) {
+            this.redDominance = redDominance;
+            this.greenDominance = greenDominance;
+            this.blueDominance = blueDominance;
+            this.neutralDominance = neutralDominance;
+        }
+
+        private double dominance(ColorQuery query) {
+            double best = 0.0;
+            if (query.wantsRed) {
+                best = Math.max(best, redDominance);
+            }
+            if (query.wantsGreen) {
+                best = Math.max(best, greenDominance);
+            }
+            if (query.wantsBlue) {
+                best = Math.max(best, blueDominance);
+            }
+            return best;
+        }
+    }
+
+    private static final class TrackPoint {
+        private final double timestampSeconds;
+        private final double centroidX;
+        private final double centroidY;
+
+        private TrackPoint(double timestampSeconds, double centroidX, double centroidY) {
+            this.timestampSeconds = timestampSeconds;
+            this.centroidX = centroidX;
+            this.centroidY = centroidY;
         }
     }
 

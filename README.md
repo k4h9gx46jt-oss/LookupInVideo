@@ -47,6 +47,41 @@ Ekkor a cim: http://localhost:8090
 ./run-app.sh --build-only
 ```
 
+## GPU gyorsitas (kereso algoritmus)
+
+A mozgasalapu kereses OpenCV OpenCL (GPU) gyorsitast is hasznal, ha az adott gepen elerheto.
+Ha nincs megfelelo GPU/OpenCL driver, automatikusan CPU fallback modra valt.
+
+`src/main/resources/application.properties`:
+
+```properties
+lookup.video.analysis.gpu-processing=true
+```
+
+CPU-only futtatas:
+
+```properties
+lookup.video.analysis.gpu-processing=false
+```
+
+## Validacio (negativ -> pozitiv sorrend)
+
+A szarvas algoritmus finomhangolasahoz hasznald a beepitett validacios scriptet.
+A script elobb lefuttatja a negativ mintakat (szembol jovo jarmuves klipek),
+utana a pozitiv mintat (Demo1), es rovid tablazatot ad.
+
+```bash
+cd /Users/SEV0A/java/LookupInVideo
+./run_async_video_check.sh
+```
+
+Before/After osszehasonlitashoz futtasd ket profilnevvel:
+
+```bash
+PROFILE_LABEL=BEFORE ./run_async_video_check.sh
+PROFILE_LABEL=AFTER  ./run_async_video_check.sh
+```
+
 ## Alternativ inditas Maven-nel
 
 Ha script nelkul inditanad:

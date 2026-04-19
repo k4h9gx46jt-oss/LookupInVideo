@@ -272,7 +272,10 @@
     // -----------------------------------------------------------------------
     // Könyvtár-szintű keresés + progress
     // -----------------------------------------------------------------------
-    let _pollActive = false;    let _resultUrl  = '';
+    let _pollActive = false;
+    let _resultUrl  = '';
+    let _pollFailures = 0;
+    const MAX_POLL_FAILURES = 6;
 
     function searchSingle() {
         if (!selectedFile) { alert('Kerjuk, kattints egy videofajlra a listabol!'); return; }
@@ -290,6 +293,7 @@
             if (data.error) { hideOverlay(); alert('Hiba: ' + data.error); return; }
             _resultUrl = '/result-single/' + data.jobId;
             _pollActive = true;
+            _pollFailures = 0;
             pollProgress(data.jobId);
         })
         .catch(err => { hideOverlay(); alert('Halozati hiba: ' + err.message); });
@@ -316,6 +320,7 @@
             }
             _resultUrl = '/results/' + data.jobId;
             _pollActive = true;
+            _pollFailures = 0;
             pollProgress(data.jobId);
         })
         .catch(err => {
@@ -327,8 +332,17 @@
     function pollProgress(jobId) {
         if (!_pollActive) return;
         fetch('/progress/' + jobId)
-        .then(r => r.json())
+        .then(r => {
+            if (r.status === 404) {
+                throw new Error('JOB_NOT_FOUND');
+            }
+            if (!r.ok) {
+                throw new Error('HTTP_' + r.status);
+            }
+            return r.json();
+        })
         .then(p => {
+            _pollFailures = 0;
             updateOverlay(p);
             if (p.status === 'DONE') {
                 _pollActive = false;
@@ -341,7 +355,15 @@
                 setTimeout(() => pollProgress(jobId), 400);
             }
         })
-        .catch(() => {
+        .catch((err) => {
+            _pollFailures += 1;
+            const isNotFound = err && typeof err.message === 'string' && err.message.includes('JOB_NOT_FOUND');
+            if (isNotFound || _pollFailures >= MAX_POLL_FAILURES) {
+                _pollActive = false;
+                hideOverlay();
+                alert('A feldolgozas allapota elveszett vagy a szerver leallt. Indits uj keresest.');
+                return;
+            }
             if (_pollActive) setTimeout(() => pollProgress(jobId), 1000);
         });
     }
@@ -400,6 +422,7 @@
 
     function cancelSearch() {
         _pollActive = false;
+        _pollFailures = 0;
         hideOverlay();
     }
 </script>

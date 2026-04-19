@@ -38,9 +38,9 @@ public class JobProgress {
     public int getPercent() {
         if (total <= 0) return 0;
         if (parallelMode) {
-            return processed.get() * 100 / total;
+            return Math.min(100, processed.get() * 100 / total);
         }
-        return (int) ((processed.get() * 100L + framePercent) / total);
+        return Math.min(100, (int) ((processed.get() * 100L + framePercent) / total));
     }
 
     /** Szekvencialis mod: adott fajl megkezdesekor hivando. */
@@ -84,14 +84,16 @@ public class JobProgress {
         if (parallelMode) {
             fileProgress.put(fileName, percent);
         } else {
-            this.framePercent = percent;
+            int bounded = Math.max(0, Math.min(100, percent));
+            this.framePercent = bounded;
+            this.statusText = String.format("Feldolgozas: %s  (%d / %d) - %d%%", currentFile, processed.get() + 1, total, bounded);
         }
     }
 
     public void done(int total) {
         this.processed.set(total);
         this.total = total;
-        this.framePercent = 100;
+        this.framePercent = 0;
         this.currentFile = "";
         this.status = Status.DONE;
         this.statusText = String.format("Kesz! %d fajl feldolgozva.", total);
