@@ -111,6 +111,7 @@ public class VideoSearchService {
     private final int analysisThreadCount;
     private final long analysisTimeoutSeconds;
     private final ExecutorService analysisExecutor;
+    private final ExecutorService segmentExecutor;
     private final boolean gpuProcessingEnabled;
     private final String gpuProcessingStatus;
     private final boolean decodeHwAccelEnabled;
@@ -133,6 +134,8 @@ public class VideoSearchService {
         this.analysisThreadCount = normalizeThreadCount(configuredAnalysisThreads);
         this.analysisTimeoutSeconds = Math.max(MIN_ANALYSIS_TIMEOUT_SECONDS, configuredAnalysisTimeoutSeconds);
         this.analysisExecutor = Executors.newFixedThreadPool(this.analysisThreadCount);
+        this.segmentExecutor = Executors.newFixedThreadPool(
+                Math.max(1, Runtime.getRuntime().availableProcessors()));
         this.gpuProcessingEnabled = resolveGpuProcessingEnabled(gpuProcessingRequested);
         this.decodeHwAccelEnabled = decodeHwAccelEnabled;
         this.decodeThreadCount = decodeThreadCount;
@@ -144,6 +147,7 @@ public class VideoSearchService {
     @PreDestroy
     public void shutdownExecutors() {
         analysisExecutor.shutdownNow();
+        segmentExecutor.shutdownNow();
     }
 
     public SearchOutcome storeAndSearch(MultipartFile videoFile, String query) {
@@ -325,15 +329,86 @@ public class VideoSearchService {
         QueryMode mode = resolveMode(normalizedQuery);
         ColorQuery colorQuery = resolveColorQuery(normalizedQuery);
 
+        long durationUs = probeVideoDuration(videoPath);
+        long sampleStepUs = sampleStepForMode(mode, durationUs);
+        int analysisWidth = gpuProcessingEnabled ? ANALYSIS_WIDTH_GPU : ANALYSIS_WIDTH_CPU;
+        long analysisDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(analysisTimeoutSeconds);
+
+        int segmentCount = computeIntraVideoSegmentCount(durationUs);
+        List<SceneMatch> matches;
+
+        if (segmentCount <= 1) {
+            matches = processVideoSegment(videoPath, 0L, Long.MAX_VALUE, durationUs,
+                    mode, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos, progress, fileName);
+        } else {
+            long segmentDuration = durationUs / segmentCount;
+            List<CompletableFuture<List<SceneMatch>>> futures = new ArrayList<>();
+            for (int i = 0; i < segmentCount; i++) {
+                final long startUs = (long) i * segmentDuration;
+                final long endUs = (i == segmentCount - 1) ? Long.MAX_VALUE : startUs + segmentDuration;
+                futures.add(CompletableFuture.supplyAsync(
+                        () -> processVideoSegment(videoPath, startUs, endUs, durationUs,
+                                mode, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
+                                progress, fileName),
+                        segmentExecutor));
+            }
+            matches = new ArrayList<>();
+            for (CompletableFuture<List<SceneMatch>> future : futures) {
+                try {
+                    matches.addAll(future.get());
+                } catch (Exception ignored) {
+                    // Segment failure is non-fatal; continue with other segments.
+                }
+            }
+        }
+
+        if (mode == QueryMode.DEER) {
+            matches = postProcessDeerMatches(matches);
+        }
+
+        matches.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
+        if (matches.size() > MAX_MATCHES) {
+            matches = new ArrayList<>(matches.subList(0, MAX_MATCHES));
+        }
+        matches.sort(Comparator.comparingDouble(SceneMatch::getTimestampSeconds));
+
+        String modeLabel;
+        String note;
+        if (mode == QueryMode.COLOR) {
+            modeLabel = "Szinalapu kereses (piros / zold / kek)";
+            note = "A piros/red, zold/green es kek/blue kulcsszavak szinalapu keresest hasznalnak, mozgas-boosttal a hirtelen kepen athuzo targyakhoz.";
+        } else if (mode == QueryMode.DEER) {
+            modeLabel = "Szarvas keresese keresztmozgas alapjan";
+            note = "A szarvas/deer kulcsszavaknal a keresztiranyu mozgas dominans, az oncoming vehicles (szembol kozeledo jarmuvek) jellegu mintakat szurjuk.";
+        } else {
+            modeLabel = "Demo: mozgasalapu jelenet-kereses";
+            note = "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
+        }
+        note = note + " | " + gpuProcessingStatus + " | Szegmensek: " + segmentCount;
+
+        return new SearchOutcome(videoId, query, modeLabel, note, durationUs / 1_000_000.0, matches, fileName);
+    }
+
+    private List<SceneMatch> processVideoSegment(
+            Path videoPath,
+            long segmentStartUs,
+            long segmentEndUs,
+            long fullVideoDurationUs,
+            QueryMode mode,
+            ColorQuery colorQuery,
+            int analysisWidth,
+            long sampleStepUs,
+            long analysisDeadlineNanos,
+            JobProgress progress,
+            String fileName) {
         List<SceneMatch> matches = new ArrayList<>();
-
-        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoPath.toFile())) {
+        FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoPath.toFile());
+        try {
             startGrabberWithGpuFallback(grabber, decodeHwAccelEnabled, decodeThreadCount);
+            if (segmentStartUs > 0L) {
+                grabber.setTimestamp(segmentStartUs);
+            }
 
-            long durationUs = Math.max(grabber.getLengthInTime(), 0L);
-            long sampleStepUs = sampleStepForMode(mode, durationUs);
-            int analysisWidth = gpuProcessingEnabled ? ANALYSIS_WIDTH_GPU : ANALYSIS_WIDTH_CPU;
-            long analysisDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(analysisTimeoutSeconds);
             Java2DFrameConverter converter = new Java2DFrameConverter();
             OpenCVFrameConverter.ToMat matConverter = new OpenCVFrameConverter.ToMat();
             Mat previousSampleMat = null;
@@ -344,20 +419,18 @@ public class VideoSearchService {
             double motionEma = 0.0;
             double previousActiveRatio = Double.NaN;
             List<TrackPoint> deerTrack = new ArrayList<>();
-            long nextSampleUs = 0L;
+            long nextSampleUs = segmentStartUs;
 
             Frame frame;
             while ((frame = grabber.grabImage()) != null) {
-                if (Thread.currentThread().isInterrupted()) {
-                    throw new IllegalStateException("Az elemzes megszakitva.");
-                }
-                if (System.nanoTime() > analysisDeadlineNanos) {
-                    throw new IllegalStateException("Elemzesi timeout: a feldolgozas tullepte az idolimitet.");
-                }
+                if (Thread.currentThread().isInterrupted()) break;
+                if (System.nanoTime() > analysisDeadlineNanos) break;
 
                 long timestampUs = Math.max(grabber.getTimestamp(), 0L);
-                if (progress != null && durationUs > 0) {
-                    progress.updateFileFrame(fileName, (int) (timestampUs * 100L / durationUs));
+                if (segmentEndUs != Long.MAX_VALUE && timestampUs >= segmentEndUs) break;
+
+                if (progress != null && fullVideoDurationUs > 0) {
+                    progress.updateFileFrame(fileName, (int) (timestampUs * 100L / fullVideoDurationUs));
                 }
                 if (timestampUs < nextSampleUs) {
                     continue;
@@ -367,7 +440,6 @@ public class VideoSearchService {
                 if (frameMat == null || frameMat.empty()) {
                     continue;
                 }
-
                 Mat scaledMat = scale(frameMat, analysisWidth);
                 if (scaledMat == null || scaledMat.empty()) {
                     continue;
@@ -393,19 +465,18 @@ public class VideoSearchService {
                     double shiftUnitY = motionMetrics.globalShiftY / shiftMagnitude;
                     longitudinalAxisX = longitudinalAxisX * 0.88 + shiftUnitX * 0.12;
                     longitudinalAxisY = longitudinalAxisY * 0.88 + shiftUnitY * 0.12;
-
                     double axisMagnitude = Math.hypot(longitudinalAxisX, longitudinalAxisY);
                     if (axisMagnitude > 1e-6) {
-                    longitudinalAxisX /= axisMagnitude;
-                    longitudinalAxisY /= axisMagnitude;
+                        longitudinalAxisX /= axisMagnitude;
+                        longitudinalAxisY /= axisMagnitude;
                     }
                 }
 
                 double burstBase = mode == QueryMode.DEER ? motionMetrics.residualIntensity : motionMetrics.intensity;
                 double burstScore = Math.max(0.0, burstBase - motionEma);
                 motionEma = motionEma == 0.0
-                    ? burstBase
-                    : (motionEma * 0.85 + burstBase * 0.15);
+                        ? burstBase
+                        : (motionEma * 0.85 + burstBase * 0.15);
                 double activeGrowth = Double.isNaN(previousActiveRatio)
                         ? 0.0
                         : Math.max(0.0, motionMetrics.activeRatio - previousActiveRatio);
@@ -417,11 +488,11 @@ public class VideoSearchService {
                 double lateralTrackScore = 0.0;
                 if (mode == QueryMode.DEER) {
                     lateralTrackScore = computeLateralTrackScore(
-                        deerTrack,
-                        timestampUs / 1_000_000.0,
-                        motionMetrics,
-                        axisXNow,
-                        axisYNow
+                            deerTrack,
+                            timestampUs / 1_000_000.0,
+                            motionMetrics,
+                            axisXNow,
+                            axisYNow
                     );
                 }
                 if (previousSampleMat != null) {
@@ -451,7 +522,7 @@ public class VideoSearchService {
                             && motionMetrics.crossMotionRatio >= 0.48
                             && motionMetrics.residualIntensity >= 0.020
                             && vehicleColorSignal < 0.20;
-                        boolean crossingCore = lateralTrackScore >= 0.70
+                    boolean crossingCore = lateralTrackScore >= 0.70
                             && motionMetrics.crossMotionRatio >= 0.40;
                     boolean likelyRoadVehicleByColor = vehicleColorSignal >= 0.20
                             && motionMetrics.centerRatio >= 0.30
@@ -464,19 +535,19 @@ public class VideoSearchService {
                         continue;
                     }
                     if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
-                        || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)) {
+                            || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)) {
                         continue;
                     }
                     if (!strongCrossingCandidate
-                        && (looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
-                        || looksLikeLowCrossHighTrackVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                        || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
-                        || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
-                        || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
-                        || looksLikeColorfulMidLateralRoadVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                        || looksLikeHighLateralRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                        || looksLikeColoredRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                        || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal))) {
+                            && (looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
+                            || looksLikeLowCrossHighTrackVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                            || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
+                            || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
+                            || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
+                            || looksLikeColorfulMidLateralRoadVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                            || looksLikeHighLateralRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                            || looksLikeColoredRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                            || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal))) {
                         continue;
                     }
                     score = computeDeerScore(
@@ -489,7 +560,7 @@ public class VideoSearchService {
                     );
                     reason = String.format(
                             Locale.ROOT,
-                        "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%% | Oldalpalya: %.1f%% | Autoszin: %.1f%%",
+                            "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%% | Oldalpalya: %.1f%% | Autoszin: %.1f%%",
                             score * 100,
                             motionMetrics.crossMotionRatio * 100,
                             motionMetrics.residualIntensity * 100,
@@ -515,51 +586,48 @@ public class VideoSearchService {
                 String preview = createPreviewDataUrl(image);
                 double timestampSeconds = timestampUs / 1_000_000.0;
                 if (mode == QueryMode.DEER) {
-                    // Deer crossings are often scored at motion peak; shift towards crossing start for better UX.
                     double deerLeadSeconds = computeDeerTimestampLeadSeconds(motionMetrics, lateralTrackScore, score);
                     timestampSeconds = Math.max(0.0, timestampSeconds - deerLeadSeconds);
                 }
                 matches.add(new SceneMatch(timestampSeconds, score, reason, preview));
-
-                if (durationUs > 0 && timestampUs >= durationUs) {
-                    break;
-                }
             }
 
             if (previousSampleMat != null) {
                 previousSampleMat.release();
             }
-
             grabber.stop();
-
-            if (mode == QueryMode.DEER) {
-                matches = postProcessDeerMatches(matches);
-            }
-
-            matches.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
-            if (matches.size() > MAX_MATCHES) {
-                matches = new ArrayList<>(matches.subList(0, MAX_MATCHES));
-            }
-            matches.sort(Comparator.comparingDouble(SceneMatch::getTimestampSeconds));
-
-            String modeLabel;
-            String note;
-            if (mode == QueryMode.COLOR) {
-                modeLabel = "Szinalapu kereses (piros / zold / kek)";
-                note = "A piros/red, zold/green es kek/blue kulcsszavak szinalapu keresest hasznalnak, mozgas-boosttal a hirtelen kepen athuzo targyakhoz.";
-            } else if (mode == QueryMode.DEER) {
-                modeLabel = "Szarvas keresese keresztmozgas alapjan";
-                note = "A szarvas/deer kulcsszavaknal a keresztiranyu mozgas dominans, az oncoming vehicles (szembol kozeledo jarmuvek) jellegu mintakat szurjuk.";
-            } else {
-                modeLabel = "Demo: mozgasalapu jelenet-kereses";
-                note = "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
-            }
-            note = note + " | " + gpuProcessingStatus;
-
-            return new SearchOutcome(videoId, query, modeLabel, note, durationUs / 1_000_000.0, matches, fileName);
         } catch (Exception ex) {
-            throw new IllegalStateException("A video feldolgozasa sikertelen: " + ex.getMessage(), ex);
+            // Segment failure is non-fatal; return whatever matches were accumulated.
+        } finally {
+            try { grabber.close(); } catch (Exception ignored) {}
         }
+        return matches;
+    }
+
+    private long probeVideoDuration(Path videoPath) {
+        FFmpegFrameGrabber probe = new FFmpegFrameGrabber(videoPath.toFile());
+        try {
+            probe.setOption("threads", "1");
+            probe.setOption("hwaccel", "none");
+            probe.start();
+            long dur = Math.max(0L, probe.getLengthInTime());
+            probe.stop();
+            return dur;
+        } catch (Exception ex) {
+            return 0L;
+        } finally {
+            try { probe.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private int computeIntraVideoSegmentCount(long durationUs) {
+        if (durationUs < 5_000_000L) {
+            return 1;
+        }
+        int cores = Runtime.getRuntime().availableProcessors();
+        // One segment per ~4 seconds, capped at the number of available CPU cores.
+        int byDuration = (int) Math.max(1L, durationUs / 4_000_000L);
+        return Math.min(cores, byDuration);
     }
 
     private static QueryMode resolveMode(String normalizedQuery) {
