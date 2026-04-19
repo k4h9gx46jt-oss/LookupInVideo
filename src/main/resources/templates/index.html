@@ -71,6 +71,7 @@
         .prog-file-count { color: #888; font-size: 0.85rem; margin-bottom: 24px; }
         .prog-cancel { padding: 8px 24px; border-radius: 8px; background: #333;
                        color: #aaa; border: 1px solid #555; cursor: pointer; font-size: 0.9rem; }
+        .prog-timer { color: #8888bb; font-size: 0.83rem; margin: -10px 0 16px; letter-spacing: 0.02em; }
     </style>
 </head>
 <body>
@@ -185,6 +186,7 @@
             <span class="prog-pct-label" id="progPct">0%</span>
         </div>
         <p class="prog-file-count" id="progFileCount"></p>
+        <p class="prog-timer" id="progTimer"></p>
         <p id="progMatchCount" style="color:#44c868; font-size:0.9rem; margin-bottom:20px; display:none;"></p>
 
         <button class="prog-cancel" onclick="cancelSearch()">Megszakitas</button>
@@ -278,6 +280,7 @@
     let _resultUrl  = '';
     let _pollFailures = 0;
     const MAX_POLL_FAILURES = 6;
+    let _searchStartTime = 0;
 
     function searchSingle() {
         if (!selectedFile) { alert('Kerjuk, kattints egy videofajlra a listabol!'); return; }
@@ -412,9 +415,27 @@
         } else {
             matchEl.style.display = 'none';
         }
+
+        // Elapsed + ETA
+        const timerEl = document.getElementById('progTimer');
+        if (timerEl && _searchStartTime > 0) {
+            const elapsedSec = Math.round((Date.now() - _searchStartTime) / 1000);
+            const pct = p.percent || 0;
+            function fmtTime(s) {
+                const m = Math.floor(s / 60), sec = s % 60;
+                return m + ':' + (sec < 10 ? '0' : '') + sec;
+            }
+            let timerText = 'Eltelt: ' + fmtTime(elapsedSec);
+            if (pct >= 2 && elapsedSec > 3) {
+                const etaSec = Math.round(elapsedSec * (100 - pct) / pct);
+                timerText += '  \u2022  Becslés: még ~' + fmtTime(etaSec);
+            }
+            timerEl.textContent = timerText;
+        }
     }
 
     function showOverlay() {
+        _searchStartTime = Date.now();
         document.getElementById('progressOverlay').style.display = 'flex';
     }
 
