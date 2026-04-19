@@ -439,9 +439,11 @@ public class VideoSearchService {
                     double neutralSignal = colorStats.neutralDominance;
                     if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
                         || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)
+                        || looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
                         || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
                         || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
                         || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
+                        || looksLikeColorfulMidLateralRoadVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeHighLateralRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeColoredRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal)) {
@@ -769,6 +771,24 @@ public class VideoSearchService {
                 && (activeGrowth >= ONCOMING_ACTIVE_GROWTH_MIN || motion.centerRatio >= 0.38);
     }
 
+    private static boolean looksLikeCenteredLowLateralVehicle(MotionMetrics motion, double lateralTrackScore) {
+        return motion.centerRatio >= 0.46
+                && lateralTrackScore <= 0.24
+                && motion.crossMotionRatio <= 0.58
+                && motion.residualIntensity >= 0.045;
+    }
+
+    private static boolean looksLikeColorfulMidLateralRoadVehicle(MotionMetrics motion,
+                                                                   double lateralTrackScore,
+                                                                   double vehicleColorSignal) {
+        return vehicleColorSignal >= 0.20
+                && motion.centerRatio >= 0.38
+                && lateralTrackScore >= 0.55
+                && lateralTrackScore <= 0.90
+                && motion.crossMotionRatio <= 0.70
+                && motion.residualIntensity >= 0.045;
+    }
+
     private static boolean looksLikeOvertrackedRoadFlow(MotionMetrics motion, double lateralTrackScore) {
         return motion.crossMotionRatio >= OVERTRACKED_FLOW_CROSS_MIN
                 && motion.centerRatio >= OVERTRACKED_FLOW_CENTER_MIN
@@ -786,15 +806,15 @@ public class VideoSearchService {
                 && motion.residualIntensity >= 0.030;
     }
 
-        private static boolean looksLikeHighLateralRoadSweep(MotionMetrics motion,
-                                 double lateralTrackScore,
-                                 double vehicleColorSignal) {
+    private static boolean looksLikeHighLateralRoadSweep(MotionMetrics motion,
+                                                         double lateralTrackScore,
+                                                         double vehicleColorSignal) {
         return vehicleColorSignal >= 0.16
-            && lateralTrackScore >= 0.85
-            && motion.crossMotionRatio >= 0.70
-            && motion.centerRatio >= 0.30
-            && motion.residualIntensity >= 0.045;
-        }
+                && lateralTrackScore >= 0.85
+                && motion.crossMotionRatio >= 0.70
+                && motion.centerRatio >= 0.30
+                && motion.residualIntensity >= 0.045;
+    }
 
     private static boolean looksLikeCenterApproach(MotionMetrics motion, double lateralTrackScore) {
         return motion.centerRatio >= CENTER_APPROACH_CENTER_RATIO_MIN
