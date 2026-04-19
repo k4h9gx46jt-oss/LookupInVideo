@@ -132,6 +132,7 @@ public class VideoSearchService {
                     String fileName = videoPath.getFileName().toString();
                     String videoId = UUID.randomUUID().toString();
                     videoRegistry.put(videoId, videoPath);
+                    progress.startFileTracking(fileName);
                     try {
                         SearchOutcome outcome = analyzeVideo(videoId, videoPath, q, fileName, progress);
                         int matchCount = outcome.getMatches().isEmpty() ? 0 : outcome.getMatches().size();
@@ -192,7 +193,7 @@ public class VideoSearchService {
             while ((frame = grabber.grabImage()) != null) {
                 long timestampUs = Math.max(grabber.getTimestamp(), 0L);
                 if (progress != null && durationUs > 0) {
-                    progress.updateFrame((int) (timestampUs * 100L / durationUs));
+                    progress.updateFileFrame(fileName, (int) (timestampUs * 100L / durationUs));
                 }
                 if (timestampUs < nextSampleUs) {
                     continue;

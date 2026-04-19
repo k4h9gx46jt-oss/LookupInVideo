@@ -51,19 +51,21 @@
                        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .prog-label { color: #ccc; font-size: 0.82rem; text-align: left; margin-bottom: 4px; }
         .prog-bar-wrap { background: #2a2a3d; border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
-        .prog-bar-inner { height: 10px; background: #6c63ff; width: 0%; transition: width 0.4s; }
-        .prog-bar-inner.shimmer {
-            background: linear-gradient(90deg, #6c63ff 25%, #a89fff 50%, #6c63ff 75%);
-            background-size: 200% 100%;
-            animation: shimmer 1.4s linear infinite;
-            width: 100% !important;
-        }
-        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+        .prog-bar-inner { height: 10px; background: #6c63ff; width: 0%; transition: width 0.3s; }
         .prog-bar-inner.green { background: #44c868; height: 22px; }
         .prog-pct-row { position: relative; margin-bottom: 6px; }
         .prog-pct-row .prog-bar-inner { height: 22px; }
         .prog-pct-label { position: absolute; inset: 0; display: flex; align-items: center;
                           justify-content: center; font-size: 0.85rem; font-weight: 700; color: #fff; }
+        /* Per-file bars */
+        .prog-file-row { margin-bottom: 10px; text-align: left; }
+        .prog-file-name { font-size: 0.78rem; color: #aaa; white-space: nowrap; overflow: hidden;
+                          text-overflow: ellipsis; max-width: 100%; display: block; margin-bottom: 3px; }
+        .prog-file-bar-wrap { background: #2a2a3d; border-radius: 6px; overflow: hidden;
+                              position: relative; height: 10px; }
+        .prog-file-bar-inner { height: 10px; background: #6c63ff; width: 0%; transition: width 0.3s; }
+        .prog-file-pct { position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+                         font-size: 0.7rem; color: #fff; font-weight: 600; line-height: 1; }
         .prog-file-count { color: #888; font-size: 0.85rem; margin-bottom: 24px; }
         .prog-cancel { padding: 8px 24px; border-radius: 8px; background: #333;
                        color: #aaa; border: 1px solid #555; cursor: pointer; font-size: 0.9rem; }
@@ -173,12 +175,7 @@
         <h2>Kereses folyamatban...</h2>
         <p class="prog-status" id="progStatus">Elokeszites...</p>
 
-        <div id="progFrameSection">
-            <p class="prog-label">Aktualis fajl:</p>
-            <div class="prog-bar-wrap">
-                <div class="prog-bar-inner" id="progFrameBar"></div>
-            </div>
-        </div>
+        <div id="progFileBars"><!-- per-file progress bars --></div>
 
         <p class="prog-label">Osszes haladas:</p>
         <div class="prog-bar-wrap prog-pct-row">
@@ -304,20 +301,32 @@
     }
 
     function updateOverlay(p) {
-        document.getElementById('progStatus').textContent     = p.statusText || '';
+        document.getElementById('progStatus').textContent = p.statusText || '';
 
-        // Frame bar: szekvencialis modban valodi %, parhuzamos modban shimmer animacio
-        const frameSection = document.getElementById('progFrameSection');
-        const frameBar     = document.getElementById('progFrameBar');
-        if (frameSection) frameSection.style.display = 'block';
-        if (p.parallelMode) {
-            frameBar.classList.add('shimmer');
-            frameBar.style.width = '';
+        // Per-file progress bars
+        const container = document.getElementById('progFileBars');
+        const fp = p.fileProgress || {};
+        const entries = Object.entries(fp);
+        if (entries.length > 0) {
+            let html = '<p class="prog-label">Aktivan feldolgozas alatt (' + entries.length + ' fajl):</p>';
+            entries.forEach(function([name, pct]) {
+                html += '<div class="prog-file-row">' +
+                    '<span class="prog-file-name">' + name + '</span>' +
+                    '<div class="prog-file-bar-wrap">' +
+                    '<div class="prog-file-bar-inner" style="width:' + pct + '%"></div>' +
+                    (pct > 5 ? '<span class="prog-file-pct">' + pct + '%</span>' : '') +
+                    '</div></div>';
+            });
+            container.innerHTML = html;
+        } else if (!p.parallelMode) {
+            const pct = p.framePercent || 0;
+            container.innerHTML = '<p class="prog-label">Aktualis fajl:</p>' +
+                '<div class="prog-bar-wrap"><div class="prog-bar-inner" style="width:' + pct + '%"></div></div>';
         } else {
-            frameBar.classList.remove('shimmer');
-            frameBar.style.width = (p.framePercent || 0) + '%';
+            container.innerHTML = '';
         }
 
+        // Osszes haladas
         document.getElementById('progOverallBar').style.width = (p.percent || 0) + '%';
         document.getElementById('progPct').textContent        = (p.percent || 0) + '%';
         if (p.total > 0) {
@@ -329,7 +338,7 @@
         const matchEl = document.getElementById('progMatchCount');
         if (p.matchesFound > 0) {
             matchEl.style.display = 'block';
-            matchEl.textContent = '✓ ' + p.matchesFound + ' talalat eddig';
+            matchEl.textContent = '\u2713 ' + p.matchesFound + ' talalat eddig';
         } else {
             matchEl.style.display = 'none';
         }

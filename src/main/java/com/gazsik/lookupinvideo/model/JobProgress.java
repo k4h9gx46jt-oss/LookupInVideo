@@ -1,5 +1,8 @@
 package com.gazsik.lookupinvideo.model;
 
+import java.util.Collections;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class JobProgress {
@@ -11,14 +14,17 @@ public class JobProgress {
     private volatile int total = 0;
     private volatile int framePercent = 0;
     private volatile String currentFile = "";
+    /** Parhuzamos mod: fajlnev -> frame-szazu szazalek (0-100) */
+    private final ConcurrentHashMap<String, Integer> fileProgress = new ConcurrentHashMap<>();
     private volatile Status status = Status.RUNNING;
     private volatile String statusText = "Feldolgozas indul...";
     private volatile String error = null;
     private volatile boolean parallelMode = false;
     private volatile int threadCount = 1;
 
-    public int getMatchesFound() { return matchesFound.get(); }
-    public int getProcessed()      { return processed.get(); }
+    public int getMatchesFound()        { return matchesFound.get(); }
+    public int getProcessed()            { return processed.get(); }
+    public Map<String, Integer> getFileProgress() { return Collections.unmodifiableMap(fileProgress); }
     public int getTotal()          { return total; }
     public int getFramePercent()   { return parallelMode ? 0 : framePercent; }
     public String getCurrentFile() { return currentFile; }
@@ -56,6 +62,7 @@ public class JobProgress {
 
     /** Parhuzamos mod: thread-safe, minden fajl befejezesekor hivando. */
     public int fileCompleted(String fileName, int matchCount) {
+        fileProgress.remove(fileName);
         matchesFound.addAndGet(matchCount);
         int done = processed.incrementAndGet();
         int m = matchesFound.get();
@@ -63,9 +70,20 @@ public class JobProgress {
         return done;
     }
 
-    /** Szekvencialis mod: frame-szintu haladas frissitese (parhuzamos modban noop). */
-    public void updateFrame(int percent) {
-        if (!parallelMode) {
+    /** Parhuzamos mod: adott fajl field-szintu progress regisztralas, 0% kezdeti ertekkel. */
+    public void startFileTracking(String fileName) {
+        if (parallelMode) fileProgress.put(fileName, 0);
+    }
+
+    /**
+     * Frame-szintu progress frissitese.
+     * Parhuzamos modban: fajlonkenti map frissitese.
+     * Szekvencialis modban: a globalis framePercent frissitese.
+     */
+    public void updateFileFrame(String fileName, int percent) {
+        if (parallelMode) {
+            fileProgress.put(fileName, percent);
+        } else {
             this.framePercent = percent;
         }
     }
