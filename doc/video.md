@@ -87,10 +87,27 @@ Ha csak forditani szeretnel futas nelkul:
 
 Ez a fejezet a jelenlegi implementaciot irja le 1:1-ben, kulon kiemelve a keresztiranyu (deer/szarvas) mozgast.
 
+### 5.0 Ervenyes kulcsszavak (HU/EN) es mit csinalnak
+
+- COLOR mod (szinalapu kereses + mozgas boost):
+  - piros / red
+  - zold / green
+  - kek / blue
+  - Ha tobb szin-kulcsszo szerepel, a rendszer ezek kozul a legerosebb szin-dominanciat hasznalja.
+- DEER mod (keresztiranyu szarvas-jellegu mozgas):
+  - szarvas / deer
+  - A rendszer az oldaliranyu atfutast preferalja, es szuri az oncoming vehicles
+    (szembol kozeledo jarmuvek) mintakat.
+- MOTION mod (altalanos mozgas):
+  - minden mas kulcsszo / barmilyen egyeb szoveg.
+- Prioritas:
+  - Ha a queryben szin-kulcsszo is van, COLOR mod kapcsol be
+    (akkor is, ha a szovegben szerepel a szarvas/deer szo).
+
 ### 5.1 Elokeszites es mintavetelezes
 - A query normalizalasa: kisbetusites + ekezetek eltavolitasa.
 - Uzemmod valasztas:
-  - RED: ha query tartalmazza a "piros" vagy "red" szot.
+  - COLOR: ha query tartalmazza a "piros/red", "zold/green" vagy "kek/blue" szot.
   - DEER: ha query tartalmazza a "szarvas" vagy "deer" szot.
   - MOTION: minden mas eset.
 - Mintaveteli lepeskuzob idoben:
@@ -199,13 +216,13 @@ Ez a blokk azert van, hogy a rovid keresztmozgast ne nyomjak el kesobbi, eros cs
 
 ### 5.5 Masik ket mod roviden
 
-#### 5.5.1 RED mod
-- redScore = red-dominans pixelek aranya.
-- Pixel red-dominans, ha:
-  - R > 90
-  - R > G * 1.25
-  - R > B * 1.25
-- Talalat, ha redScore >= 0.12.
+#### 5.5.1 COLOR mod (piros/zold/kek)
+- colorDominance = a keresett szin(ek) dominans pixeleinek aranya.
+- Tamogatott kulcsszavak: piros/red, zold/green, kek/blue.
+- Vegso score: colorScore = clamp(colorDominance * 0.78 + colorMotionBoost * 0.22, 0, 1).
+- colorMotionBoost a kompenzalt mozgasbol (residual mozgas-intenzitas) jon, ez segit a
+  hirtelen kepen atmeno nagy szines objektumok megtalalasaban.
+- Talalat, ha colorScore >= 0.14.
 
 #### 5.5.2 MOTION mod
 - Score = intensity (nyers framekulonbseg-atlag).
@@ -234,7 +251,7 @@ A /media/{videoId} endpoint adja vissza a feltoltott fajlt:
 
 ## 8. Fontos korlatok az aktualis MVP-ben
 - A "szoveges kereses" jelenleg nem teljes NLP/objektumfelismeres.
-- A "piros" query tenylegesen szinalapu.
+- A "piros/red", "zold/green", "kek/blue" query tenylegesen szinalapu.
 - A "szarvas/deer" mod egy heurisztikus keresztmozgas-detektor, nem teljes objektumdetektor.
 - Minden mas query demo jelleggel mozgas-intenzitas alapu.
 - Ujrainditas utan az in-memory videoId->path registry elveszik.
