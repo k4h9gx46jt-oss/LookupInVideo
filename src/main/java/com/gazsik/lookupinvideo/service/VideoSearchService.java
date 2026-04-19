@@ -421,6 +421,10 @@ public class VideoSearchService {
             AtomicLong[] segmentProgressUs) {
         List<SceneMatch> matches = new ArrayList<>();
         FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoPath.toFile());
+        // Tell FFmpeg to rescale output frames to analysis width before returning to Java.
+        // This moves the (expensive) full-resolution YUV→BGR conversion down to analysis size,
+        // dramatically reducing per-frame cost – especially important for skipped frames.
+        grabber.setImageWidth(analysisWidth);
         try {
             startGrabberWithGpuFallback(grabber, decodeHwAccelEnabled, decodeThreadCount);
             // Seek to a warm-up window before the actual segment start so the EMA,
