@@ -446,9 +446,28 @@ public class VideoSearchService {
                 } else if (mode == QueryMode.DEER) {
                     double vehicleColorSignal = Math.max(colorStats.redDominance, colorStats.blueDominance);
                     double neutralSignal = colorStats.neutralDominance;
+                    boolean strongCrossingCandidate = lateralTrackScore >= 0.78
+                            && motionMetrics.crossMotionRatio >= 0.48
+                            && motionMetrics.residualIntensity >= 0.020
+                            && vehicleColorSignal < 0.20;
+                        boolean crossingCore = lateralTrackScore >= 0.70
+                            && motionMetrics.crossMotionRatio >= 0.40;
+                    boolean likelyRoadVehicleByColor = vehicleColorSignal >= 0.20
+                            && motionMetrics.centerRatio >= 0.30
+                            && motionMetrics.residualIntensity >= 0.030;
+
+                    if (!crossingCore) {
+                        continue;
+                    }
+                    if (likelyRoadVehicleByColor && !strongCrossingCandidate) {
+                        continue;
+                    }
                     if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
-                        || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)
-                        || looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
+                        || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)) {
+                        continue;
+                    }
+                    if (!strongCrossingCandidate
+                        && (looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
                         || looksLikeLowCrossHighTrackVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
                         || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
@@ -456,7 +475,7 @@ public class VideoSearchService {
                         || looksLikeColorfulMidLateralRoadVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeHighLateralRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeColoredRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                        || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal)) {
+                        || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal))) {
                         continue;
                     }
                     score = computeDeerScore(
@@ -583,7 +602,7 @@ public class VideoSearchService {
     private static boolean isMatch(QueryMode mode, double score) {
         return switch (mode) {
             case COLOR -> score >= 0.14;
-            case DEER -> score >= 0.24;
+            case DEER -> score >= 0.22;
             case MOTION -> score >= 0.18;
         };
     }
@@ -616,7 +635,7 @@ public class VideoSearchService {
             }
         }
 
-        if (filtered.isEmpty() && topScore >= 0.21) {
+        if (filtered.isEmpty() && topScore >= 0.20) {
             filtered.add(representatives.get(0));
         }
         return filtered;
