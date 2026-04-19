@@ -26,12 +26,15 @@ if ! curl -fsS "$BASE_URL/" >/dev/null 2>&1; then
 fi
 
 TMP_RESULTS="$(mktemp)"
-trap 'rm -f "$TMP_RESULTS"' EXIT
+TMP_DIR="$(mktemp -d)"
+trap 'rm -f "$TMP_RESULTS"; rm -rf "$TMP_DIR"' EXIT
 
 run_case() {
   local phase="$1"
   local expected="$2"
   local video="$3"
+  local row_out="$4"
+  local result_out="$5"
 
   local video_dir="$ROOT_DIR/$(dirname "$video")"
   local video_file="$(basename "$video")"
@@ -48,8 +51,8 @@ run_case() {
   post_error="$(printf '%s' "$post_resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("error", ""))' 2>/dev/null || true)"
 
   if [[ -z "$job_id" ]]; then
-    printf "| %s | %s | %s | ERROR | 0 | 0.0%% | FAIL | %s |\n" "$PROFILE_LABEL" "$phase" "$video" "${post_error:-failed to start job}"
-    printf "%s|%s|%s|ERROR|FAIL|0|0.0\n" "$PROFILE_LABEL" "$phase" "$video" >> "$TMP_RESULTS"
+    printf "| %s | %s | %s | ERROR | 0 | 0.0%% | FAIL | %s |\n" "$PROFILE_LABEL" "$phase" "$video" "${post_error:-failed to start job}" > "$row_out"
+    printf "%s|%s|%s|ERROR|FAIL|0|0.0\n" "$PROFILE_LABEL" "$phase" "$video" > "$result_out"
     return
   fi
 
@@ -72,8 +75,8 @@ run_case() {
     if [[ -z "$error_text" || "$error_text" == "None" ]]; then
       error_text="no result"
     fi
-    printf "| %s | %s | %s | %s | 0 | 0.0%% | FAIL | %s |\n" "$PROFILE_LABEL" "$phase" "$video" "$status" "${error_text:-no result}"
-    printf "%s|%s|%s|%s|FAIL|0|0.0\n" "$PROFILE_LABEL" "$phase" "$video" "$status" >> "$TMP_RESULTS"
+    printf "| %s | %s | %s | %s | 0 | 0.0%% | FAIL | %s |\n" "$PROFILE_LABEL" "$phase" "$video" "$status" "${error_text:-no result}" > "$row_out"
+    printf "%s|%s|%s|%s|FAIL|0|0.0\n" "$PROFILE_LABEL" "$phase" "$video" "$status" > "$result_out"
     return
   fi
 
@@ -131,9 +134,40 @@ PY
   fi
 
   printf "| %s | %s | %s | DONE | %s | %.1f%% | %s | %s |\n" \
-    "$PROFILE_LABEL" "$phase" "$video" "${match_count:-0}" "${top_score:-0}" "$verdict" "${top_reason:-none}"
+    "$PROFILE_LABEL" "$phase" "$video" "${match_count:-0}" "${top_score:-0}" "$verdict" "${top_reason:-none}" > "$row_out"
   printf "%s|%s|%s|DONE|%s|%s|%s\n" \
-    "$PROFILE_LABEL" "$phase" "$video" "$verdict" "${match_count:-0}" "${top_score:-0}" >> "$TMP_RESULTS"
+    "$PROFILE_LABEL" "$phase" "$video" "$verdict" "${match_count:-0}" "${top_score:-0}" > "$result_out"
+}
+
+run_phase_parallel() {
+  local phase="$1"
+  local expected="$2"
+  shift 2
+  local videos=("$@")
+
+  local -a pids
+  local -a row_files
+  local -a result_files
+
+  for i in "${!videos[@]}"; do
+    local row_file="$TMP_DIR/${phase}_${i}.row"
+    local result_file="$TMP_DIR/${phase}_${i}.result"
+    row_files+=("$row_file")
+    result_files+=("$result_file")
+    run_case "$phase" "$expected" "${videos[$i]}" "$row_file" "$result_file" &
+    pids+=("$!")
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
+  done
+
+  for row_file in "${row_files[@]}"; do
+    [[ -f "$row_file" ]] && cat "$row_file"
+  done
+  for result_file in "${result_files[@]}"; do
+    [[ -f "$result_file" ]] && cat "$result_file" >> "$TMP_RESULTS"
+  done
 }
 
 printf "# Validation order: NEGATIVE first, POSITIVE second\n"
@@ -141,12 +175,8 @@ printf "# Query: %s\n\n" "$QUERY"
 printf "| profile | phase | video | status | match_count | top_score | verdict | top_reason |\n"
 printf "|---|---|---|---|---:|---:|---|---|\n"
 
-for v in "${NEGATIVE_VIDEOS[@]}"; do
-  run_case "NEGATIVE" "DROP" "$v"
-done
-for v in "${POSITIVE_VIDEOS[@]}"; do
-  run_case "POSITIVE" "KEEP" "$v"
-done
+run_phase_parallel "NEGATIVE" "DROP" "${NEGATIVE_VIDEOS[@]}"
+run_phase_parallel "POSITIVE" "KEEP" "${POSITIVE_VIDEOS[@]}"
 
 printf "\n# Summary\n"
 python3 - "$TMP_RESULTS" <<'PY'

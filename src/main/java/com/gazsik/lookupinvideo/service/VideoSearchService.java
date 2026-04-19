@@ -93,6 +93,10 @@ public class VideoSearchService {
     private static final double ROAD_VEHICLE_NEUTRAL_SIGNAL_MIN = 0.33;
     private static final double VEHICLE_COLOR_DOMINANCE_FILTER = 0.18;
     private static final double NEUTRAL_COLOR_DOMINANCE_FILTER = 0.30;
+    private static final double OVERTRACKED_FLOW_CROSS_MIN = 0.75;
+    private static final double OVERTRACKED_FLOW_CENTER_MIN = 0.38;
+    private static final double OVERTRACKED_FLOW_LATERAL_MIN = 0.45;
+    private static final double OVERTRACKED_FLOW_RESIDUAL_MIN = 0.030;
     private static final List<String> VIDEO_EXTENSIONS =
             List.of(".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg");
 
@@ -435,8 +439,11 @@ public class VideoSearchService {
                     double neutralSignal = colorStats.neutralDominance;
                     if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
                         || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)
+                        || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
                         || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
                         || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
+                        || looksLikeHighLateralRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                        || looksLikeColoredRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
                         || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal)) {
                         continue;
                     }
@@ -564,7 +571,7 @@ public class VideoSearchService {
     private static boolean isMatch(QueryMode mode, double score) {
         return switch (mode) {
             case COLOR -> score >= 0.14;
-            case DEER -> score >= 0.16;
+            case DEER -> score >= 0.24;
             case MOTION -> score >= 0.18;
         };
     }
@@ -581,7 +588,7 @@ public class VideoSearchService {
         representatives.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
 
         double topScore = representatives.get(0).getConfidence();
-        double dynamicThreshold = clamp(topScore * 0.60, 0.16, 0.36);
+        double dynamicThreshold = clamp(topScore * 0.60, 0.19, 0.36);
 
         List<SceneMatch> filtered = new ArrayList<>();
         for (SceneMatch candidate : representatives) {
@@ -597,7 +604,7 @@ public class VideoSearchService {
             }
         }
 
-        if (filtered.isEmpty()) {
+        if (filtered.isEmpty() && topScore >= 0.21) {
             filtered.add(representatives.get(0));
         }
         return filtered;
@@ -670,7 +677,8 @@ public class VideoSearchService {
         if (configuredThreadCount > 0) {
             return Math.max(1, configuredThreadCount);
         }
-        return Math.max(2, available);
+        // Slight oversubscription helps hide decode / I/O waits and keeps GPU feed steadier.
+        return Math.max(2, Math.min(24, available * 2));
     }
 
     private static boolean resolveGpuProcessingEnabled(boolean gpuProcessingRequested) {
@@ -724,6 +732,9 @@ public class VideoSearchService {
         double neutralPenalty = clamp((neutralDominance - 0.18) / 0.30, 0.0, 1.0)
             * clamp((motion.centerRatio - 0.30) / 0.55, 0.0, 1.0)
             * clamp((0.42 - lateralTrackScore) / 0.42, 0.0, 1.0);
+        double overtrackedFlowPenalty = clamp((motion.crossMotionRatio - 0.80) / 0.14, 0.0, 1.0)
+            * clamp((motion.centerRatio - 0.28) / 0.20, 0.0, 1.0)
+            * clamp((lateralTrackScore - 0.50) / 0.40, 0.0, 1.0);
 
         double combined =
             directionalConfidence * 0.63 +
@@ -732,9 +743,10 @@ public class VideoSearchService {
             foregroundIsolation * 0.06 +
             compactness * 0.06;
 
-        combined -= oncomingPenalty * 0.38;
-        combined -= colorPenalty * 0.22;
-        combined -= neutralPenalty * 0.14;
+        combined -= oncomingPenalty * 0.42;
+        combined -= colorPenalty * 0.30;
+        combined -= neutralPenalty * 0.20;
+        combined -= overtrackedFlowPenalty * 0.26;
 
         return clamp(combined, 0.0, 1.0);
     }
@@ -757,6 +769,33 @@ public class VideoSearchService {
                 && (activeGrowth >= ONCOMING_ACTIVE_GROWTH_MIN || motion.centerRatio >= 0.38);
     }
 
+    private static boolean looksLikeOvertrackedRoadFlow(MotionMetrics motion, double lateralTrackScore) {
+        return motion.crossMotionRatio >= OVERTRACKED_FLOW_CROSS_MIN
+                && motion.centerRatio >= OVERTRACKED_FLOW_CENTER_MIN
+                && lateralTrackScore >= OVERTRACKED_FLOW_LATERAL_MIN
+                && motion.residualIntensity >= OVERTRACKED_FLOW_RESIDUAL_MIN;
+    }
+
+    private static boolean looksLikeColoredRoadSweep(MotionMetrics motion,
+                                                     double lateralTrackScore,
+                                                     double vehicleColorSignal) {
+        return vehicleColorSignal >= 0.24
+                && lateralTrackScore >= 0.85
+                && motion.crossMotionRatio >= 0.65
+                && motion.centerRatio >= 0.18
+                && motion.residualIntensity >= 0.030;
+    }
+
+        private static boolean looksLikeHighLateralRoadSweep(MotionMetrics motion,
+                                 double lateralTrackScore,
+                                 double vehicleColorSignal) {
+        return vehicleColorSignal >= 0.16
+            && lateralTrackScore >= 0.85
+            && motion.crossMotionRatio >= 0.70
+            && motion.centerRatio >= 0.30
+            && motion.residualIntensity >= 0.045;
+        }
+
     private static boolean looksLikeCenterApproach(MotionMetrics motion, double lateralTrackScore) {
         return motion.centerRatio >= CENTER_APPROACH_CENTER_RATIO_MIN
                 && motion.travelScore <= CENTER_APPROACH_TRAVEL_SCORE_MAX
@@ -767,8 +806,9 @@ public class VideoSearchService {
 
     private static boolean looksLikeVehicleColorBlob(MotionMetrics motion, ColorStats colorStats, double lateralTrackScore) {
         double vehicleColor = Math.max(colorStats.redDominance, colorStats.blueDominance);
-        boolean centerish = motion.centerRatio >= 0.34;
-        boolean weakLateral = lateralTrackScore < 0.35 && motion.crossTravel <= 0.018;
+        boolean centerish = motion.centerRatio >= 0.32;
+        boolean weakLateral = lateralTrackScore < 0.45
+                && (motion.crossTravel <= 0.026 || motion.travelScore <= 0.46);
         boolean vividVehicle = vehicleColor >= VEHICLE_COLOR_DOMINANCE_FILTER;
         boolean neutralVehicle = colorStats.neutralDominance >= NEUTRAL_COLOR_DOMINANCE_FILTER;
         return centerish && weakLateral && (vividVehicle || neutralVehicle);
@@ -779,7 +819,8 @@ public class VideoSearchService {
                                                        double vehicleColorSignal,
                                                        double neutralSignal) {
         boolean roadLikeMotion = motion.centerRatio >= 0.34 && motion.residualIntensity >= 0.030;
-        boolean colorfulVehicle = vehicleColorSignal >= ROAD_VEHICLE_COLOR_SIGNAL_MIN && lateralTrackScore >= 0.70;
+        boolean colorfulVehicle = vehicleColorSignal >= ROAD_VEHICLE_COLOR_SIGNAL_MIN
+            && (lateralTrackScore >= 0.70 || lateralTrackScore <= 0.22);
         boolean neutralVehicle = neutralSignal >= ROAD_VEHICLE_NEUTRAL_SIGNAL_MIN && lateralTrackScore < 0.80;
         return roadLikeMotion && (colorfulVehicle || neutralVehicle);
     }
