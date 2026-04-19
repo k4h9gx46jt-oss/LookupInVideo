@@ -10,6 +10,7 @@ public class SearchOutcome {
     private final String note;
     private final double durationSeconds;
     private final List<SceneMatch> matches;
+    private final String fileName;
 
     public SearchOutcome(String videoId,
                          String query,
@@ -17,16 +18,31 @@ public class SearchOutcome {
                          String note,
                          double durationSeconds,
                          List<SceneMatch> matches) {
+        this(videoId, query, mode, note, durationSeconds, matches, "");
+    }
+
+    public SearchOutcome(String videoId,
+                         String query,
+                         String mode,
+                         String note,
+                         double durationSeconds,
+                         List<SceneMatch> matches,
+                         String fileName) {
         this.videoId = videoId;
         this.query = query;
         this.mode = mode;
         this.note = note;
         this.durationSeconds = durationSeconds;
         this.matches = List.copyOf(matches);
+        this.fileName = fileName != null ? fileName : "";
     }
 
     public String getVideoId() {
         return videoId;
+    }
+
+    public String getFileName() {
+        return fileName;
     }
 
     public String getQuery() {

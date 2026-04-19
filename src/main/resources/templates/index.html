@@ -5,6 +5,62 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LookupInVideo | Jelenetkereses</title>
     <link rel="stylesheet" th:href="@{/css/app.css}">
+    <style>
+        .tab-bar { display: flex; gap: 0; margin-bottom: 0; border-bottom: 2px solid var(--accent, #6c63ff); }
+        .tab-btn { padding: 10px 28px; background: none; border: none; cursor: pointer; font-size: 1rem;
+                   color: #aaa; border-radius: 8px 8px 0 0; transition: background 0.2s, color 0.2s; }
+        .tab-btn.active { background: var(--accent, #6c63ff); color: #fff; font-weight: 600; }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
+        .dir-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+        .dir-bar input { flex: 1; padding: 9px 14px; border-radius: 8px; border: 1px solid #444;
+                         background: #1e1e2e; color: #fff; font-size: 0.97rem; }
+        .dir-bar button { padding: 9px 20px; border-radius: 8px; background: var(--accent, #6c63ff);
+                          color: #fff; border: none; cursor: pointer; font-size: 0.97rem; white-space: nowrap; }
+
+        .file-explorer { border: 1px solid #333; border-radius: 10px; overflow: hidden; margin-bottom: 14px; }
+        .file-explorer-header { background: #2a2a3d; padding: 8px 16px; font-size: 0.85rem; color: #888;
+                                 display: flex; gap: 12px; }
+        .file-item { display: flex; align-items: center; gap: 12px; padding: 9px 16px; cursor: pointer;
+                     border-bottom: 1px solid #2a2a3a; transition: background 0.15s; }
+        .file-item:last-child { border-bottom: none; }
+        .file-item:hover { background: #2a2a45; }
+        .file-item.selected { background: #3a3060; border-left: 3px solid var(--accent, #6c63ff); }
+        .file-icon { font-size: 1.3rem; }
+        .file-name { flex: 1; font-size: 0.96rem; }
+        .file-ext { font-size: 0.8rem; color: #888; background: #222; padding: 2px 8px; border-radius: 4px; }
+        .no-files { padding: 24px; text-align: center; color: #666; font-style: italic; }
+
+        .search-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+        .search-row input { flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid #444;
+                            background: #1e1e2e; color: #fff; font-size: 0.97rem; }
+        .search-row button { padding: 10px 24px; border-radius: 8px; background: var(--accent, #6c63ff);
+                             color: #fff; border: none; cursor: pointer; font-size: 0.97rem; white-space: nowrap; }
+        .search-row .btn-all { background: #2a9d50; }
+        .search-row .btn-all:hover { background: #22883f; }
+        .selected-label { font-size: 0.88rem; color: #aaa; margin-bottom: 4px; min-height: 1.2em; }
+
+        /* Progress overlay */
+        #progressOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.80);
+                           z-index: 1000; align-items: center; justify-content: center; }
+        .prog-card { background: #1a1a2e; border: 1px solid #444; border-radius: 16px;
+                     padding: 36px 40px; min-width: 440px; max-width: 92vw; text-align: center; }
+        .prog-card h2 { color: #fff; margin: 0 0 8px; }
+        .prog-status { color: #aaa; font-size: 0.9rem; margin-bottom: 20px;
+                       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .prog-label { color: #ccc; font-size: 0.82rem; text-align: left; margin-bottom: 4px; }
+        .prog-bar-wrap { background: #2a2a3d; border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
+        .prog-bar-inner { height: 10px; background: #6c63ff; width: 0%; transition: width 0.4s; }
+        .prog-bar-inner.green { background: #44c868; height: 22px; }
+        .prog-pct-row { position: relative; margin-bottom: 6px; }
+        .prog-pct-row .prog-bar-inner { height: 22px; }
+        .prog-pct-label { position: absolute; inset: 0; display: flex; align-items: center;
+                          justify-content: center; font-size: 0.85rem; font-weight: 700; color: #fff; }
+        .prog-file-count { color: #888; font-size: 0.85rem; margin-bottom: 24px; }
+        .prog-cancel { padding: 8px 24px; border-radius: 8px; background: #333;
+                       color: #aaa; border: 1px solid #555; cursor: pointer; font-size: 0.9rem; }
+    </style>
 </head>
 <body>
 <div class="bg-orb bg-orb-left"></div>
@@ -15,41 +71,252 @@
         <p class="kicker">LookupInVideo</p>
         <h1>Video jelenetek keresese szoveges leirassal</h1>
         <p class="lead">
-            Tolts fel egy videot, majd ird be mit keresel (pl. "piros auto", "kutya", "kamion").
-            Ez az alapverzio mar visszaad hasznalhato jelenet-talalatokat, es jo kiindulopont tovabbi AI boviteshez.
+            Valassz ki egy helyi video konyvtarat, majd ird be, mit keresel.
         </p>
     </section>
 
     <section class="panel">
-        <form th:action="@{/search}" method="post" enctype="multipart/form-data" class="search-form">
-            <label class="field">
-                <span>Video fajl</span>
-                <input type="file" name="video" accept="video/*" required>
-            </label>
-
-            <label class="field">
-                <span>Kereses</span>
-                <input type="text"
-                       name="query"
-                       placeholder="Pelda: piros auto, kutya, szarvas"
-                       th:value="${query}"
-                       required>
-            </label>
-
-            <button type="submit" class="cta">Kereses inditasa</button>
-        </form>
-
         <p class="error" th:if="${error}" th:text="${error}"></p>
 
-        <div class="hint-box">
+        <!-- Fül-választó -->
+        <div class="tab-bar">
+            <button class="tab-btn" id="tab-local-btn" onclick="switchTab('local')">Helyi konyvtar</button>
+            <button class="tab-btn" id="tab-upload-btn" onclick="switchTab('upload')">Feltoltes</button>
+        </div>
+
+        <!-- === HELYI KÖNYVTÁR TAB === -->
+        <div class="tab-panel" id="tab-local">
+            <!-- Könyvtár megadása -->
+            <form method="get" action="/browse" id="browse-form" style="margin-top:18px;">
+                <div class="dir-bar">
+                    <input type="text" name="dir" id="dirInput"
+                           th:value="${videoDir}"
+                           placeholder="Pelda: /Users/nev/Videos  vagy  C:\Videos">
+                    <input type="hidden" name="query" th:value="${query}">
+                    <button type="submit">Konyvtar betoltese</button>
+                </div>
+            </form>
+
+            <!-- File Explorer lista -->
+            <div class="file-explorer">
+                <div class="file-explorer-header">
+                    <span>Videofajlok</span>
+                    <span th:if="${videoFiles != null and !videoFiles.isEmpty()}"
+                          th:text="'(' + ${videoFiles.size()} + ' db)'"></span>
+                </div>
+                <div th:if="${videoFiles == null or videoFiles.isEmpty()}" class="no-files">
+                    <span th:if="${videoDir == null or videoDir.isBlank()}">Add meg a konyvtar eleresi utjat fent, majd kattints a "Konyvtar betoltese" gombra.</span>
+                    <span th:if="${videoDir != null and !videoDir.isBlank()}">Nem talalhato videofajl ebben a konyvtarban.</span>
+                </div>
+                <div th:each="f, fStat : ${videoFiles}"
+                     class="file-item"
+                     th:id="'file-' + ${fStat.index}"
+                     th:data-index="${fStat.index}"
+                     th:data-filename="${f}"
+                     onclick="selectFile(this)">
+                    <span class="file-icon">🎬</span>
+                    <span class="file-name" th:text="${f}"></span>
+                    <span class="file-ext"></span>
+                </div>
+            </div>
+
+            <!-- Keresés helyi fájlból -->
+            <form method="post" action="/search-local" id="local-search-form">
+                <input type="hidden" name="videoDir" th:value="${videoDir}" id="localVideoDir">
+                <input type="hidden" name="videoFile" id="localVideoFile" value="">
+                <p class="selected-label" id="selectedLabel">Kivalasztott fajl: <em>nincs</em></p>
+                <div class="search-row">
+                    <input type="text" name="query" id="localQuery"
+                           th:value="${query}"
+                           placeholder="Pelda: piros auto, kutya, szarvas">
+                    <button type="submit" onclick="return validateLocal()">Kereses (kivalasztott fajl)</button>
+                    <button type="button" class="btn-all" onclick="searchDir()">Kereses az egesz konyvtarban</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- === FELTÖLTÉS TAB === -->
+        <div class="tab-panel" id="tab-upload">
+            <form th:action="@{/search}" method="post" enctype="multipart/form-data"
+                  class="search-form" style="margin-top:18px;">
+                <label class="field">
+                    <span>Video fajl feltoltese</span>
+                    <input type="file" name="video" accept="video/*" required>
+                </label>
+                <label class="field">
+                    <span>Kereses</span>
+                    <input type="text" name="query"
+                           placeholder="Pelda: piros auto, kutya, szarvas"
+                           th:value="${query}" required>
+                </label>
+                <button type="submit" class="cta">Kereses inditasa</button>
+            </form>
+        </div>
+
+        <div class="hint-box" style="margin-top:18px;">
             <strong>Megjegyzes az MVP-rol:</strong>
-            <p>
-                A "piros" tipusu kereses mar szinalapon mukodik.
-                Mas kifejezeseknel jelenleg mozgas-intenzitas alapjan rangsoroljuk a jeleneteket,
-                amit kovetkezo lepesben objektumfelismeressel (dog/deer/truck/car) lehet boviteni.
-            </p>
+            <p>A "piros" szinalapu, a "szarvas/deer" keresztmozgas-detektor, minden mas mozgas-intenzitas alapu.</p>
         </div>
     </section>
 </main>
+
+<!-- Progress overlay -->
+<div id="progressOverlay" style="display:none;">
+    <div class="prog-card">
+        <h2>Kereses folyamatban...</h2>
+        <p class="prog-status" id="progStatus">Elokeszites...</p>
+
+        <p class="prog-label">Aktualis fajl:</p>
+        <div class="prog-bar-wrap">
+            <div class="prog-bar-inner" id="progFrameBar"></div>
+        </div>
+
+        <p class="prog-label">Osszes haladas:</p>
+        <div class="prog-bar-wrap prog-pct-row">
+            <div class="prog-bar-inner green" id="progOverallBar"></div>
+            <span class="prog-pct-label" id="progPct">0%</span>
+        </div>
+        <p class="prog-file-count" id="progFileCount"></p>
+
+        <button class="prog-cancel" onclick="cancelSearch()">Megszakitas</button>
+    </div>
+</div>
+
+<script>
+    // Aktív fájl
+    let selectedFile = '';
+
+    function switchTab(tab) {
+        document.getElementById('tab-local').classList.toggle('active', tab === 'local');
+        document.getElementById('tab-upload').classList.toggle('active', tab === 'upload');
+        document.getElementById('tab-local-btn').classList.toggle('active', tab === 'local');
+        document.getElementById('tab-upload-btn').classList.toggle('active', tab === 'upload');
+    }
+
+    function selectFile(el) {
+        document.querySelectorAll('.file-item').forEach(e => e.classList.remove('selected'));
+        el.classList.add('selected');
+
+        selectedFile = el.dataset.filename;
+        document.getElementById('localVideoFile').value = selectedFile;
+        document.getElementById('selectedLabel').innerHTML =
+            'Kivalasztott fajl: <strong>' + selectedFile + '</strong>';
+
+        // kiterjesztes badge
+        const extEl = el.querySelector('.file-ext');
+        if (extEl) {
+            const parts = selectedFile.split('.');
+            extEl.textContent = parts.length > 1 ? parts[parts.length - 1].toUpperCase() : '';
+        }
+    }
+
+    function validateLocal() {
+        if (!selectedFile) {
+            alert('Kerjuk, kattints egy videofajlra a listabol!');
+            return false;
+        }
+        const q = document.getElementById('localQuery').value.trim();
+        if (!q) {
+            alert('Adj meg egy szoveges keresest!');
+            return false;
+        }
+        return true;
+    }
+
+    // Oldalbetöltéskor: ha van videolista, helyi tab aktív, egyébként helyi tab aktív alapból
+    window.addEventListener('DOMContentLoaded', function () {
+        switchTab('local');
+        // kiterjesztes badge feltoltese minden sorhoz
+        document.querySelectorAll('.file-item').forEach(function(el) {
+            const name = el.dataset.filename || '';
+            const extEl = el.querySelector('.file-ext');
+            if (extEl && name.includes('.')) {
+                const parts = name.split('.');
+                extEl.textContent = parts[parts.length - 1].toUpperCase();
+            }
+        });
+    });
+
+    // -----------------------------------------------------------------------
+    // Könyvtár-szintű keresés + progress
+    // -----------------------------------------------------------------------
+    let _pollActive = false;
+
+    function searchDir() {
+        const dir = document.getElementById('dirInput').value.trim();
+        const q   = document.getElementById('localQuery').value.trim();
+        if (!dir) { alert('Add meg a konyvtar eleresi utjat!'); return; }
+        if (!q)   { alert('Adj meg egy keresesi szoveget!'); return; }
+
+        showOverlay();
+
+        fetch('/search-dir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ videoDir: dir, query: q })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                hideOverlay();
+                alert('Hiba: ' + data.error);
+                return;
+            }
+            _pollActive = true;
+            pollProgress(data.jobId);
+        })
+        .catch(err => {
+            hideOverlay();
+            alert('Halozati hiba: ' + err.message);
+        });
+    }
+
+    function pollProgress(jobId) {
+        if (!_pollActive) return;
+        fetch('/progress/' + jobId)
+        .then(r => r.json())
+        .then(p => {
+            updateOverlay(p);
+            if (p.status === 'DONE') {
+                _pollActive = false;
+                window.location.href = '/results/' + jobId;
+            } else if (p.status === 'ERROR') {
+                _pollActive = false;
+                hideOverlay();
+                alert('Hiba a feldolgozas soran: ' + (p.error || 'ismeretlen hiba'));
+            } else {
+                setTimeout(() => pollProgress(jobId), 400);
+            }
+        })
+        .catch(() => {
+            if (_pollActive) setTimeout(() => pollProgress(jobId), 1000);
+        });
+    }
+
+    function updateOverlay(p) {
+        document.getElementById('progStatus').textContent     = p.statusText || '';
+        document.getElementById('progFrameBar').style.width   = (p.framePercent || 0) + '%';
+        document.getElementById('progOverallBar').style.width = (p.percent || 0) + '%';
+        document.getElementById('progPct').textContent        = (p.percent || 0) + '%';
+        if (p.total > 0) {
+            document.getElementById('progFileCount').textContent =
+                p.processed + ' / ' + p.total + ' fajl feldolgozva';
+        }
+    }
+
+    function showOverlay() {
+        document.getElementById('progressOverlay').style.display = 'flex';
+    }
+
+    function hideOverlay() {
+        document.getElementById('progressOverlay').style.display = 'none';
+    }
+
+    function cancelSearch() {
+        _pollActive = false;
+        hideOverlay();
+    }
+</script>
 </body>
 </html>
+

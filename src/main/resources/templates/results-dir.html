@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="hu" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LookupInVideo | Konyvtar talalatok</title>
+    <link rel="stylesheet" th:href="@{/css/app.css}">
+    <style>
+        .file-section { margin-bottom: 40px; }
+        .file-header { display: flex; align-items: center; gap: 14px; padding: 14px 20px;
+                       background: #1e1e2e; border-radius: 10px 10px 0 0;
+                       border: 1px solid #333; border-bottom: none; }
+        .file-header h2 { margin: 0; font-size: 1.05rem; color: #e0e0ff; flex: 1; }
+        .file-meta { font-size: 0.85rem; color: #888; }
+        .file-body { border: 1px solid #333; border-radius: 0 0 10px 10px;
+                     padding: 18px 20px; background: #13131f; }
+        .video-toggle { padding: 6px 18px; background: #2a2a45; color: #aaa;
+                        border: 1px solid #444; border-radius: 6px; cursor: pointer;
+                        font-size: 0.85rem; transition: background 0.2s; }
+        .video-toggle:hover { background: #3a3060; color: #fff; }
+        .inline-player { width: 100%; max-height: 340px; border-radius: 8px;
+                         display: none; margin-bottom: 16px; }
+        .no-match-note { color: #666; font-style: italic; font-size: 0.9rem; }
+        .summary-bar { background: #1e1e2e; border: 1px solid #333; border-radius: 10px;
+                       padding: 16px 24px; margin-bottom: 32px;
+                       display: flex; gap: 32px; flex-wrap: wrap; align-items: center; }
+        .summary-bar .stat { text-align: center; }
+        .summary-bar .stat-num { font-size: 1.8rem; font-weight: 700; color: #6c63ff; }
+        .summary-bar .stat-label { font-size: 0.82rem; color: #888; }
+    </style>
+</head>
+<body>
+<div class="bg-orb bg-orb-left"></div>
+<div class="bg-orb bg-orb-right"></div>
+
+<main class="container">
+    <section class="hero compact">
+        <p class="kicker">Konyvtar-kereses eredmenye</p>
+        <h1 th:text="'Kereses: ' + ${query}"></h1>
+    </section>
+
+    <div class="summary-bar">
+        <div class="stat">
+            <div class="stat-num" th:text="${totalScanned}"></div>
+            <div class="stat-label">fajl feldolgozva</div>
+        </div>
+        <div class="stat">
+            <div class="stat-num" th:text="${#lists.size(outcomes)}"></div>
+            <div class="stat-label">fajlban talaltunk egyezest</div>
+        </div>
+        <div class="stat">
+            <div class="stat-num"
+                 th:text="${outcomes.isEmpty() ? 0 : outcomes.stream().mapToInt(o -> o.matches.size()).sum()}"></div>
+            <div class="stat-label">osszes talalat</div>
+        </div>
+        <div style="flex:1; text-align:right;">
+            <a class="cta secondary" th:href="@{/}">Uj kereses</a>
+        </div>
+    </div>
+
+    <!-- Nincs találat -->
+    <section class="panel" th:if="${outcomes.isEmpty()}">
+        <p>Egyetlen fajlban sem talaltunk egyezest a "<span th:text="${query}"></span>" keresesre.</p>
+        <p style="color:#888; font-size:0.9rem;">Probald mas kulcsszoval, pl.: piros, szarvas, deer.</p>
+    </section>
+
+    <!-- Fájlonkénti eredmények -->
+    <div th:each="outcome : ${outcomes}" class="file-section">
+        <div class="file-header">
+            <span style="font-size:1.4rem;">🎬</span>
+            <h2 th:text="${outcome.fileName}"></h2>
+            <span class="file-meta"
+                  th:text="${#lists.size(outcome.matches)} + ' talalat | ' + ${outcome.formattedDuration}"></span>
+            <button class="video-toggle"
+                    th:attr="data-videoid=${outcome.videoId}"
+                    onclick="togglePlayer(this)">▶ Video megnyitasa</button>
+        </div>
+        <div class="file-body">
+            <video class="inline-player"
+                   controls
+                   th:id="'player-' + ${outcome.videoId}">
+                <source th:src="@{/media/{id}(id=${outcome.videoId})}" type="video/mp4">
+            </video>
+
+            <div class="results-grid">
+                <article class="result-card" th:each="match : ${outcome.matches}">
+                    <img th:if="${match.previewDataUrl != ''}"
+                         th:src="${match.previewDataUrl}"
+                         alt="Jelenet elonezet">
+                    <div class="result-content">
+                        <h3 th:text="'Idopont: ' + ${match.formattedTimestamp}"></h3>
+                        <p th:text="${match.reason}"></p>
+                        <button class="jump"
+                                type="button"
+                                th:attr="data-seconds=${match.timestampSeconds},data-videoid=${outcome.videoId}"
+                                onclick="seekTo(this)">Ugras a videohoz</button>
+                    </div>
+                </article>
+            </div>
+        </div>
+    </div>
+</main>
+
+<script>
+    function togglePlayer(btn) {
+        const videoId = btn.getAttribute('data-videoid');
+        const player = document.getElementById('player-' + videoId);
+        if (!player) return;
+        const visible = player.style.display === 'block';
+        player.style.display = visible ? 'none' : 'block';
+        btn.textContent = visible ? '▶ Video megnyitasa' : '✕ Video bezarasa';
+    }
+
+    function seekTo(btn) {
+        const videoId = btn.getAttribute('data-videoid');
+        const seconds = Number(btn.getAttribute('data-seconds'));
+        const player = document.getElementById('player-' + videoId);
+        if (!player) return;
+
+        player.style.display = 'block';
+        const toggleBtn = player.closest('.file-body').previousElementSibling
+                            .querySelector('.video-toggle');
+        if (toggleBtn) toggleBtn.textContent = '✕ Video bezarasa';
+
+        if (!Number.isNaN(seconds)) {
+            player.currentTime = seconds;
+            player.play();
+            player.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    }
+</script>
+</body>
+</html>

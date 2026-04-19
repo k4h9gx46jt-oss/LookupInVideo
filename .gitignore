@@ -5,3 +5,8 @@ target/
 .DS_Store
 uploads/*
 !uploads/.gitkeep
+
+# Video and image files
+*.mp4
+*.jpg
+*.jpeg

@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.text.Normalizer;
+import com.gazsik.lookupinvideo.model.JobProgress;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
@@ -28,7 +29,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Service
 public class VideoSearchService {
@@ -41,9 +45,13 @@ public class VideoSearchService {
     private static final int GLOBAL_SHIFT_MAX_DX = 8;
     private static final int GLOBAL_SHIFT_MAX_DY = 6;
     private static final int GLOBAL_SHIFT_SAMPLE_STRIDE = 4;
+    private static final List<String> VIDEO_EXTENSIONS =
+            List.of(".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg");
 
     private final Path storagePath;
     private final Map<String, Path> videoRegistry = new ConcurrentHashMap<>();
+    private final Map<String, JobProgress> progressMap = new ConcurrentHashMap<>();
+    private final Map<String, List<SearchOutcome>> dirResultMap = new ConcurrentHashMap<>();
 
     public VideoSearchService(@Value("${lookup.video.storage-path:uploads}") String storageDir) throws IOException {
         this.storagePath = Paths.get(storageDir).toAbsolutePath().normalize();
@@ -66,14 +74,87 @@ public class VideoSearchService {
         }
 
         videoRegistry.put(videoId, targetPath);
-        return analyzeVideo(videoId, targetPath, query == null ? "" : query.trim());
+        String displayName = videoFile.getOriginalFilename() != null ? videoFile.getOriginalFilename() : safeName;
+        return analyzeVideo(videoId, targetPath, query == null ? "" : query.trim(), displayName, null);
+    }
+
+    public SearchOutcome searchByPath(Path videoPath, String query) {
+        if (videoPath == null || !Files.exists(videoPath)) {
+            throw new IllegalArgumentException("A videofajl nem talalhato: " + videoPath);
+        }
+        String videoId = UUID.randomUUID().toString();
+        videoRegistry.put(videoId, videoPath);
+        return analyzeVideo(videoId, videoPath, query == null ? "" : query.trim(),
+                videoPath.getFileName().toString(), null);
     }
 
     public Path resolveVideoPath(String videoId) {
         return videoRegistry.get(videoId);
     }
 
-    private SearchOutcome analyzeVideo(String videoId, Path videoPath, String query) {
+    // -------------------------------------------------------------------------
+    // Könyvtár-szintű aszinkron keresés
+    // -------------------------------------------------------------------------
+
+    public String startDirectorySearch(Path dirPath, String query) throws IOException {
+        List<Path> videoFiles;
+        try (Stream<Path> stream = Files.list(dirPath)) {
+            videoFiles = stream
+                    .filter(Files::isRegularFile)
+                    .filter(p -> {
+                        String lower = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                        return VIDEO_EXTENSIONS.stream().anyMatch(lower::endsWith);
+                    })
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
+
+        if (videoFiles.isEmpty()) {
+            throw new IllegalArgumentException("Nincs videofajl a konyvtarban: " + dirPath);
+        }
+
+        String jobId = UUID.randomUUID().toString();
+        JobProgress progress = new JobProgress();
+        progress.startFile(0, videoFiles.size(), videoFiles.get(0).getFileName().toString());
+        progressMap.put(jobId, progress);
+
+        final String q = query == null ? "" : query.trim();
+
+        CompletableFuture.runAsync(() -> {
+            List<SearchOutcome> outcomes = new ArrayList<>();
+            for (int i = 0; i < videoFiles.size(); i++) {
+                Path videoPath = videoFiles.get(i);
+                String fileName = videoPath.getFileName().toString();
+                progress.startFile(i, videoFiles.size(), fileName);
+
+                String videoId = UUID.randomUUID().toString();
+                videoRegistry.put(videoId, videoPath);
+                try {
+                    SearchOutcome outcome = analyzeVideo(videoId, videoPath, q, fileName, progress);
+                    if (!outcome.getMatches().isEmpty()) {
+                        outcomes.add(outcome);
+                    }
+                } catch (Exception ex) {
+                    // egy fájl hibája ne állítsa le az egész keresést
+                }
+            }
+            dirResultMap.put(jobId, outcomes);
+            progress.done(videoFiles.size());
+        });
+
+        return jobId;
+    }
+
+    public JobProgress getProgress(String jobId) {
+        return progressMap.get(jobId);
+    }
+
+    public List<SearchOutcome> getDirectoryResults(String jobId) {
+        return dirResultMap.get(jobId);
+    }
+
+    private SearchOutcome analyzeVideo(String videoId, Path videoPath, String query,
+                                        String fileName, JobProgress progress) {
         String normalizedQuery = stripAccents(query).toLowerCase(Locale.ROOT);
         QueryMode mode = resolveMode(normalizedQuery);
 
@@ -96,6 +177,9 @@ public class VideoSearchService {
             Frame frame;
             while ((frame = grabber.grabImage()) != null) {
                 long timestampUs = Math.max(grabber.getTimestamp(), 0L);
+                if (progress != null && durationUs > 0) {
+                    progress.updateFrame((int) (timestampUs * 100L / durationUs));
+                }
                 if (timestampUs < nextSampleUs) {
                     continue;
                 }
@@ -209,7 +293,7 @@ public class VideoSearchService {
                 note = "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
             }
 
-            return new SearchOutcome(videoId, query, modeLabel, note, durationUs / 1_000_000.0, matches);
+            return new SearchOutcome(videoId, query, modeLabel, note, durationUs / 1_000_000.0, matches, fileName);
         } catch (Exception ex) {
             throw new IllegalStateException("A video feldolgozasa sikertelen: " + ex.getMessage(), ex);
         }
