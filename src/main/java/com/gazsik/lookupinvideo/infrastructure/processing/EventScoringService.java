@@ -11,8 +11,8 @@ public class EventScoringService {
         return switch (intent) {
             case COLOR -> score >= 0.14;
             case WILDLIFE -> score >= 0.21;
-            // TURN: horizDom * motionGate alapu jel, kanyarnal ~0.5-0.9, egyenesen ~0
-            case TURN -> score >= 0.40;
+            // TURN: lateralSweepScore * motionGate (0=szimmetrikus/egyenes, 1=teljesen aszimmetrikus/kanyar)
+            case TURN -> score >= 0.30;
             default -> score >= 0.18;
         };
     }
@@ -34,7 +34,7 @@ public class EventScoringService {
         return switch (intent) {
             case COLOR -> "A piros/red, zold/green es kek/blue kulcsszavak szinalapu keresest hasznalnak, mozgas-boosttal a hirtelen kepen athuzo targyakhoz.";
             case WILDLIFE -> "A szarvas/deer/vad kulcsszavaknal a keresztiranyu mozgas dominans, az oncoming vehicle jellegu mintakat szurjuk.";
-            case TURN -> "A kanyar intent jelenleg a mozgasalapu baseline-ra fallbackel, a dedikalt esemeny-detektor kesobb jon.";
+            case TURN -> "Ket fuggetlen jel kombinacioja: (1) kepszel-aszimmetria (lateralSweep) — nagy kanyarnal is mukodik, nem telitodik; (2) horizontalis shift + koherencia — kis/kozepes kanyarhoz. A ket jel maximuma * mozgaskapu adja a vegs\u0151 pontszamot.";
             case LANE_CHANGE -> "A savvaltas intent jelenleg a mozgasalapu baseline-ra fallbackel, a geometriara epulo lane-modell kesobb jon.";
             case CROSSING_VEHICLE -> "A keresztbe meno jarmu intent jelenleg a mozgasalapu baseline-ra fallbackel, dedikalt tracker alapu esemenylogika kesobb jon.";
             case ANOMALY -> "Az anomalia intent jelenleg a mozgasalapu baseline-ra fallbackel; candidate + verifier ketlepcsos logika kesobb jon.";

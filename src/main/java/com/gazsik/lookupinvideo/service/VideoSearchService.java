@@ -691,22 +691,45 @@ public class VideoSearchService {
                                 vehicleColorSignal * 100
                         );
                     } else if (intent == QueryIntent.TURN) {
-                        // Kanyarnal a kamera vizszintesen fordul, ezert |globalShiftX| nagy (max 8px),
-                        // egyenes haladásnal közel nulla. Ez jobb jelzo, mint a nyers intenzitas.
-                        double absX = Math.abs(motionMetrics.globalShiftX);
-                        double absY = Math.abs(motionMetrics.globalShiftY);
-                        // +1 denominator floor: shiftX=1 -> 0.50, shiftX=0 -> 0.0
-                        double horizDom = absX / (absX + absY + 1.0);
-                        // Minimum mozgaskapu: az auto haladjon (ne alljon)
+                        // === PROPER TURN DETECTOR (ket fuggetlen jel kombinacioja) ===
+                        //
+                        // Jel 1 – lateralSweepScore (elsdleges, nagy kanyarnal is mukodik):
+                        //   Bal vs jobb kepszel pixelkulonbseg aszimmetriaja.
+                        //   Kanyarnal az egyik szelen uj kep-tartalom jelenik meg (magas diff),
+                        //   a masik elden a kamera el"ol eltunik a tartalom (kisebb diff).
+                        //   Nem fugg a globalShift becslesi tartomanytol, tehat nem telitodik.
+                        //
+                        // Jel 2 – horizShiftCoherence (masodlagos, kis/kozepes kanyarnal):
+                        //   globalShiftX horizontalis dominanciaja ES alacsony maradek intenzitas.
+                        //   A maradek (residualIntensity) akkor kicsi, ha a jelenet EGYSEGESen
+                        //   mozdul (kanyar), es nagy, ha csak EGY targy mozog (keresztezo auto).
+                        //   horizShift * coherence = 0, ha nincs horizontalis mozgas.
+                        //
+                        // Mozgaskapu: az auto haladjon (ne allojarmu).
                         double motionGate = clamp(motionMetrics.intensity / 0.04, 0.0, 1.0);
-                        score = horizDom * motionGate;
-                        String turnDir = motionMetrics.globalShiftX > 1.5 ? "<- balra"
-                                : motionMetrics.globalShiftX < -1.5 ? "-> jobbra"
-                                : "egyenes/ismeretlen";
+
+                        // Jel 1
+                        double sweepSig = motionMetrics.lateralSweepScore;
+
+                        // Jel 2
+                        double absShiftX = Math.abs(motionMetrics.globalShiftX);
+                        double absShiftY = Math.abs(motionMetrics.globalShiftY);
+                        double horizShift = absShiftX / (absShiftX + absShiftY + 1.0);
+                        double coherence = 1.0 - clamp(
+                                motionMetrics.residualIntensity / (motionMetrics.intensity + 0.005),
+                                0.0, 1.0);
+                        double shiftCoh = horizShift * coherence;
+
+                        // A ket jel maximumat vesszuk: ha barmelyik tuz, talal
+                        score = Math.max(sweepSig, shiftCoh) * motionGate;
+
+                        String turnDir = motionMetrics.globalShiftX > 0.5 ? "<- balra"
+                                : motionMetrics.globalShiftX < -0.5 ? "-> jobbra"
+                                : "ismeretlen irany";
                         reason = String.format(Locale.ROOT,
-                                "Kanyar-jel: %.1f%% [%s] | globShift=(%+.0f,%+.0f) | intenz=%.1f%%",
+                                "Kanyar: %.1f%% [%s] | szelsym=%.1f%% shiftCoh=%.1f%% | intenz=%.1f%%",
                                 score * 100, turnDir,
-                                motionMetrics.globalShiftX, motionMetrics.globalShiftY,
+                                sweepSig * 100, shiftCoh * 100,
                                 motionMetrics.intensity * 100);
                     } else {
                         score = motionMetrics.intensity;
@@ -1208,6 +1231,33 @@ public class VideoSearchService {
             GlobalShift shift = estimateGlobalShiftOpenCl(previousShared, currentShared, width, height);
             double intensity = rgbDiffMean01(previousShared, currentShared, preferGpu);
 
+            // Lateral sweep: left edge vs right edge asymmetry — direct camera-pan signal,
+            // independent of the shift estimator accuracy/saturation.
+            // IMPORTANT: use colRange().copyTo() to produce CONTIGUOUS mats — avoid ROI-of-ROI
+            // + GPU upload which can throw UnsupportedOperationException in JavaCV.
+            // Always CPU (preferGpu=false) for safety here.
+            double lateralSweepScore = 0.0;
+            int sweepCols = Math.max(4, width / 16);
+            if (sweepCols * 2 < width) {
+                Mat prevL = new Mat(); Mat currL = new Mat();
+                Mat prevR = new Mat(); Mat currR = new Mat();
+                try {
+                    previousShared.colRange(0, sweepCols).copyTo(prevL);
+                    currentShared.colRange(0, sweepCols).copyTo(currL);
+                    previousShared.colRange(width - sweepCols, width).copyTo(prevR);
+                    currentShared.colRange(width - sweepCols, width).copyTo(currR);
+                    double ledgeDiff = rgbDiffMean01(prevL, currL, false);
+                    double redgeDiff = rgbDiffMean01(prevR, currR, false);
+                    double swMax = Math.max(ledgeDiff, redgeDiff);
+                    double swMin = Math.min(ledgeDiff, redgeDiff);
+                    lateralSweepScore = (swMax - swMin) / (swMax + swMin + 0.005);
+                } catch (Throwable ignored) {
+                    // sweep computation failed, lateralSweepScore stays 0
+                } finally {
+                    prevL.release(); currL.release(); prevR.release(); currR.release();
+                }
+            }
+
             int startX = Math.max(0, -shift.dx);
             int endX = Math.min(width, width - shift.dx);
             int startY = Math.max(0, -shift.dy);
@@ -1227,6 +1277,7 @@ public class VideoSearchService {
                         0.0,
                         0.0,
                         0.0,
+                        lateralSweepScore,
                         shift.dx,
                         shift.dy
                 );
@@ -1284,6 +1335,7 @@ public class VideoSearchService {
                             0.0,
                             0.0,
                             0.0,
+                            lateralSweepScore,
                             shift.dx,
                             shift.dy
                     );
@@ -1363,6 +1415,7 @@ public class VideoSearchService {
                         crossTravel,
                         parallelTravel,
                         travelScore,
+                        lateralSweepScore,
                         shift.dx,
                         shift.dy
                 );
@@ -1579,6 +1632,11 @@ public class VideoSearchService {
         double weightedY = 0.0;
         double centerWeight = 0.0;
 
+        // Lateral sweep accumulators
+        int sweepEdgeW = Math.max(4, width / 16);
+        double ledgeSum = 0.0; int ledgeSamples = 0;
+        double redgeSum = 0.0; int redgeSamples = 0;
+
         int roiStartX = (int) Math.round(width * 0.10);
         int roiEndX = (int) Math.round(width * 0.90);
         int roiStartY = (int) Math.round(height * 0.22);
@@ -1597,8 +1655,13 @@ public class VideoSearchService {
                 int rawDiffR = Math.abs(((rgbA >> 16) & 0xFF) - ((rgbRaw >> 16) & 0xFF));
                 int rawDiffG = Math.abs(((rgbA >> 8) & 0xFF) - ((rgbRaw >> 8) & 0xFF));
                 int rawDiffB = Math.abs((rgbA & 0xFF) - (rgbRaw & 0xFF));
-                rawSum += (rawDiffR + rawDiffG + rawDiffB) / 765.0;
+                double rawDiffNorm = (rawDiffR + rawDiffG + rawDiffB) / 765.0;
+                rawSum += rawDiffNorm;
                 rawSamples++;
+
+                // Track left/right edge for lateral sweep
+                if (x < sweepEdgeW) { ledgeSum += rawDiffNorm; ledgeSamples++; }
+                else if (x >= width - sweepEdgeW) { redgeSum += rawDiffNorm; redgeSamples++; }
 
                 int shiftedX = x + shift.dx;
                 int shiftedY = y + shift.dy;
@@ -1643,6 +1706,12 @@ public class VideoSearchService {
         double residualIntensity = residualSamples == 0 ? 0.0 : residualSum / residualSamples;
         double activeRatio = active / (double) Math.max(1, roiSamples);
 
+        double ledgeDiff = ledgeSamples > 0 ? ledgeSum / ledgeSamples : intensity;
+        double redgeDiff = redgeSamples > 0 ? redgeSum / redgeSamples : intensity;
+        double sweepMax = Math.max(ledgeDiff, redgeDiff);
+        double sweepMin = Math.min(ledgeDiff, redgeDiff);
+        double lateralSweepScore = (sweepMax - sweepMin) / (sweepMax + sweepMin + 0.005);
+
         double centroidX;
         double centroidY;
         if (motionWeight <= 0.0) {
@@ -1686,6 +1755,7 @@ public class VideoSearchService {
                 crossTravel,
                 parallelTravel,
                 travelScore,
+                lateralSweepScore,
                 shift.dx,
                 shift.dy
         );
@@ -1960,6 +2030,8 @@ public class VideoSearchService {
         private final double crossTravel;
         private final double parallelTravel;
         private final double travelScore;
+        /** Asymmetry between left and right image edges (0=symmetric, 1=full asymmetry). High during turns. */
+        private final double lateralSweepScore;
         private final double globalShiftX;
         private final double globalShiftY;
 
@@ -1973,6 +2045,7 @@ public class VideoSearchService {
                               double crossTravel,
                               double parallelTravel,
                               double travelScore,
+                              double lateralSweepScore,
                               double globalShiftX,
                               double globalShiftY) {
             this.intensity = intensity;
@@ -1985,12 +2058,13 @@ public class VideoSearchService {
             this.crossTravel = crossTravel;
             this.parallelTravel = parallelTravel;
             this.travelScore = travelScore;
+            this.lateralSweepScore = lateralSweepScore;
             this.globalShiftX = globalShiftX;
             this.globalShiftY = globalShiftY;
         }
 
         private static MotionMetrics empty() {
-            return new MotionMetrics(0.0, 0.0, 0.0, 0.0, 0.5, 0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            return new MotionMetrics(0.0, 0.0, 0.0, 0.0, 0.5, 0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         }
     }
 
