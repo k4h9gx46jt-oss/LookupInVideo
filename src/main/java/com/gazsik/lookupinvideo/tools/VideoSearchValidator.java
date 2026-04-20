@@ -2,6 +2,11 @@ package com.gazsik.lookupinvideo.tools;
 
 import com.gazsik.lookupinvideo.model.SceneMatch;
 import com.gazsik.lookupinvideo.model.SearchOutcome;
+import com.gazsik.lookupinvideo.infrastructure.processing.EventPostProcessor;
+import com.gazsik.lookupinvideo.infrastructure.processing.EventScoringService;
+import com.gazsik.lookupinvideo.infrastructure.video.FrameSampler;
+import com.gazsik.lookupinvideo.infrastructure.video.VideoDecoderService;
+import com.gazsik.lookupinvideo.service.QueryInterpretationService;
 import com.gazsik.lookupinvideo.service.VideoSearchService;
 
 import java.nio.file.Files;
@@ -51,7 +56,20 @@ public final class VideoSearchValidator {
             return;
         }
 
-        VideoSearchService service = new VideoSearchService("uploads", 0, 900L, true, false, 0, 0);
+        VideoSearchService service = new VideoSearchService(
+            new QueryInterpretationService(),
+            new FrameSampler(),
+            new VideoDecoderService(),
+            new EventScoringService(),
+            new EventPostProcessor(),
+            "uploads",
+            0,
+            900L,
+            true,
+            false,
+            0,
+            0
+        );
         try {
             System.out.println("| file | matches | top_reason | elapsed_ms |");
             System.out.println("|---|---:|---|---:|");

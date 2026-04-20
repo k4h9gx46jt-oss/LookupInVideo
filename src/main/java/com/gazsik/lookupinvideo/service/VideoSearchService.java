@@ -1,5 +1,12 @@
 package com.gazsik.lookupinvideo.service;
 
+import com.gazsik.lookupinvideo.domain.enums.QueryIntent;
+import com.gazsik.lookupinvideo.domain.model.ColorQuery;
+import com.gazsik.lookupinvideo.domain.model.SearchQueryInterpretation;
+import com.gazsik.lookupinvideo.infrastructure.processing.EventPostProcessor;
+import com.gazsik.lookupinvideo.infrastructure.processing.EventScoringService;
+import com.gazsik.lookupinvideo.infrastructure.video.FrameSampler;
+import com.gazsik.lookupinvideo.infrastructure.video.VideoDecoderService;
 import com.gazsik.lookupinvideo.model.SceneMatch;
 import com.gazsik.lookupinvideo.model.SearchOutcome;
 import org.bytedeco.ffmpeg.global.avutil;
@@ -29,7 +36,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
-import java.text.Normalizer;
 import com.gazsik.lookupinvideo.model.JobProgress;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -68,8 +74,6 @@ import static org.bytedeco.opencv.global.opencv_imgproc.threshold;
 @Service
 public class VideoSearchService {
 
-    private static final long DEFAULT_SAMPLE_STEP_US = 1_000_000L;
-    private static final long DEER_SAMPLE_STEP_US = 150_000L;
     private static final int ANALYSIS_WIDTH_CPU = 320;
     private static final int ANALYSIS_WIDTH_GPU = 512;
     private static final int MAX_MATCHES = 12;
@@ -78,7 +82,6 @@ public class VideoSearchService {
 
     private static final double DEER_TIMESTAMP_LEAD_BASE_SECONDS = 1.1;
     private static final double DEER_TIMESTAMP_LEAD_MAX_SECONDS = 4.7;
-    private static final double DEER_CLUSTER_WINDOW_SECONDS = 2.6;
     private static final int GLOBAL_SHIFT_MAX_DX = 8;
     private static final int GLOBAL_SHIFT_MAX_DY = 6;
     private static final int GLOBAL_SHIFT_SAMPLE_STRIDE = 4;
@@ -121,8 +124,18 @@ public class VideoSearchService {
     private final boolean decodeHwAccelEnabled;
     private final int decodeThreadCount;
     private final int configuredSegmentCount;
+    private final QueryInterpretationService queryInterpretationService;
+    private final FrameSampler frameSampler;
+    private final VideoDecoderService videoDecoderService;
+    private final EventScoringService eventScoringService;
+    private final EventPostProcessor eventPostProcessor;
 
-    public VideoSearchService(@Value("${lookup.video.storage-path:uploads}") String storageDir,
+    public VideoSearchService(QueryInterpretationService queryInterpretationService,
+                              FrameSampler frameSampler,
+                              VideoDecoderService videoDecoderService,
+                              EventScoringService eventScoringService,
+                              EventPostProcessor eventPostProcessor,
+                              @Value("${lookup.video.storage-path:uploads}") String storageDir,
                               @Value("${lookup.video.analysis.max-threads:0}") int configuredAnalysisThreads,
                               @Value("${lookup.video.analysis.timeout-seconds:900}") long configuredAnalysisTimeoutSeconds,
                               @Value("${lookup.video.analysis.gpu-processing:true}") boolean gpuProcessingRequested,
@@ -135,6 +148,11 @@ public class VideoSearchService {
             // Safe fallback if ffmpeg globals are unavailable at runtime.
         }
         ImageIO.setUseCache(false);
+        this.queryInterpretationService = queryInterpretationService;
+        this.frameSampler = frameSampler;
+        this.videoDecoderService = videoDecoderService;
+        this.eventScoringService = eventScoringService;
+        this.eventPostProcessor = eventPostProcessor;
         this.storagePath = Paths.get(storageDir).toAbsolutePath().normalize();
         Files.createDirectories(this.storagePath);
         this.analysisThreadCount = normalizeThreadCount(configuredAnalysisThreads);
@@ -336,12 +354,12 @@ public class VideoSearchService {
 
     private SearchOutcome analyzeVideo(String videoId, Path videoPath, String query,
                                         String fileName, JobProgress progress) {
-        String normalizedQuery = stripAccents(query).toLowerCase(Locale.ROOT);
-        QueryMode mode = resolveMode(normalizedQuery);
-        ColorQuery colorQuery = resolveColorQuery(normalizedQuery);
+        SearchQueryInterpretation interpretation = queryInterpretationService.interpret(query);
+        QueryIntent intent = interpretation.getIntent();
+        ColorQuery colorQuery = interpretation.getColorQuery();
 
-        long durationUs = probeVideoDuration(videoPath);
-        long sampleStepUs = sampleStepForMode(mode, durationUs);
+        long durationUs = videoDecoderService.probeVideoDuration(videoPath);
+        long sampleStepUs = frameSampler.computeSampleStepUs(intent, durationUs);
         int analysisWidth = gpuProcessingEnabled ? ANALYSIS_WIDTH_GPU : ANALYSIS_WIDTH_CPU;
         long analysisDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(analysisTimeoutSeconds);
 
@@ -353,7 +371,7 @@ public class VideoSearchService {
 
         if (segmentCount <= 1) {
             matches = processVideoSegment(videoPath, 0L, Long.MAX_VALUE, durationUs,
-                    mode, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
+                    intent, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
                     progress, fileName, 0, segProgUs);
         } else {
             long segmentDuration = durationUs / segmentCount;
@@ -364,7 +382,7 @@ public class VideoSearchService {
                 final int segIdx = i;
                 futures.add(CompletableFuture.supplyAsync(
                         () -> processVideoSegment(videoPath, startUs, endUs, durationUs,
-                                mode, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
+                        intent, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
                                 progress, fileName, segIdx, segProgUs),
                         segmentExecutor));
             }
@@ -378,9 +396,7 @@ public class VideoSearchService {
             }
         }
 
-        if (mode == QueryMode.DEER) {
-            matches = postProcessDeerMatches(matches);
-        }
+        matches = eventPostProcessor.postProcess(intent, matches);
 
         matches.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
         if (matches.size() > MAX_MATCHES) {
@@ -388,18 +404,8 @@ public class VideoSearchService {
         }
         matches.sort(Comparator.comparingDouble(SceneMatch::getTimestampSeconds));
 
-        String modeLabel;
-        String note;
-        if (mode == QueryMode.COLOR) {
-            modeLabel = "Szinalapu kereses (piros / zold / kek)";
-            note = "A piros/red, zold/green es kek/blue kulcsszavak szinalapu keresest hasznalnak, mozgas-boosttal a hirtelen kepen athuzo targyakhoz.";
-        } else if (mode == QueryMode.DEER) {
-            modeLabel = "Szarvas keresese keresztmozgas alapjan";
-            note = "A szarvas/deer kulcsszavaknal a keresztiranyu mozgas dominans, az oncoming vehicles (szembol kozeledo jarmuvek) jellegu mintakat szurjuk.";
-        } else {
-            modeLabel = "Demo: mozgasalapu jelenet-kereses";
-            note = "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
-        }
+        String modeLabel = eventScoringService.modeLabel(intent);
+        String note = eventScoringService.modeNote(intent);
         note = note + " | " + gpuProcessingStatus + " | Szegmensek: " + segmentCount;
 
         return new SearchOutcome(videoId, query, modeLabel, note, durationUs / 1_000_000.0, matches, fileName);
@@ -410,7 +416,7 @@ public class VideoSearchService {
             long segmentStartUs,
             long segmentEndUs,
             long fullVideoDurationUs,
-            QueryMode mode,
+            QueryIntent intent,
             ColorQuery colorQuery,
             int analysisWidth,
             long sampleStepUs,
@@ -426,7 +432,7 @@ public class VideoSearchService {
         // dramatically reducing per-frame cost – especially important for skipped frames.
         grabber.setImageWidth(analysisWidth);
         try {
-            startGrabberWithGpuFallback(grabber, decodeHwAccelEnabled, decodeThreadCount);
+            videoDecoderService.startGrabberWithGpuFallback(grabber, decodeHwAccelEnabled, decodeThreadCount);
             // Seek to a warm-up window before the actual segment start so the EMA,
             // longitudinal axis, and deer-track state are primed before emitting matches.
             long warmupStartUs = (segmentStartUs > 0L)
@@ -506,7 +512,9 @@ public class VideoSearchService {
                     }
                 }
 
-                double burstBase = mode == QueryMode.DEER ? motionMetrics.residualIntensity : motionMetrics.intensity;
+                double burstBase = eventScoringService.usesWildlifePath(intent)
+                        ? motionMetrics.residualIntensity
+                        : motionMetrics.intensity;
                 double burstScore = Math.max(0.0, burstBase - motionEma);
                 motionEma = motionEma == 0.0
                         ? burstBase
@@ -520,7 +528,7 @@ public class VideoSearchService {
                 double axisXNow = axisNormNow < 1e-6 ? 0.0 : longitudinalAxisX / axisNormNow;
                 double axisYNow = axisNormNow < 1e-6 ? 1.0 : longitudinalAxisY / axisNormNow;
                 double lateralTrackScore = 0.0;
-                if (mode == QueryMode.DEER) {
+                if (eventScoringService.usesWildlifePath(intent)) {
                     lateralTrackScore = computeLateralTrackScore(
                             deerTrack,
                             timestampUs / 1_000_000.0,
@@ -538,7 +546,7 @@ public class VideoSearchService {
                 double score;
                 String reason;
 
-                if (mode == QueryMode.COLOR) {
+                if (intent == QueryIntent.COLOR) {
                     double colorDominance = colorStats.dominance(colorQuery);
                     double colorMotionBoost = clamp((motionMetrics.residualIntensity - 0.010) / 0.070, 0.0, 1.0);
                     score = clamp(colorDominance * 0.78 + colorMotionBoost * 0.22, 0.0, 1.0);
@@ -549,7 +557,7 @@ public class VideoSearchService {
                             colorDominance * 100,
                             colorMotionBoost * 100
                     );
-                } else if (mode == QueryMode.DEER) {
+                } else if (eventScoringService.usesWildlifePath(intent)) {
                     double vehicleColorSignal = Math.max(colorStats.redDominance, colorStats.blueDominance);
                     double neutralSignal = colorStats.neutralDominance;
                     boolean strongCrossingCandidate = lateralTrackScore >= 0.78
@@ -607,14 +615,14 @@ public class VideoSearchService {
                     reason = String.format(Locale.ROOT, "Mozgas-intenzitas: %.1f%%", motionMetrics.intensity * 100);
                 }
 
-                nextSampleUs = advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
+                nextSampleUs = frameSampler.advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
 
                 // During the warm-up window, update state but don't emit matches.
                 if (timestampUs < segmentStartUs) {
                     continue;
                 }
 
-                if (!isMatch(mode, score)) {
+                if (!eventScoringService.isMatch(intent, score)) {
                     continue;
                 }
 
@@ -624,7 +632,7 @@ public class VideoSearchService {
                 }
                 String preview = createPreviewDataUrl(image);
                 double timestampSeconds = timestampUs / 1_000_000.0;
-                if (mode == QueryMode.DEER) {
+                if (eventScoringService.usesWildlifePath(intent)) {
                     double deerLeadSeconds = computeDeerTimestampLeadSeconds(motionMetrics, lateralTrackScore, score);
                     timestampSeconds = Math.max(0.0, timestampSeconds - deerLeadSeconds);
                 }
@@ -643,22 +651,6 @@ public class VideoSearchService {
         return matches;
     }
 
-    private long probeVideoDuration(Path videoPath) {
-        FFmpegFrameGrabber probe = new FFmpegFrameGrabber(videoPath.toFile());
-        try {
-            probe.setOption("threads", "1");
-            probe.setOption("hwaccel", "none");
-            probe.start();
-            long dur = Math.max(0L, probe.getLengthInTime());
-            probe.stop();
-            return dur;
-        } catch (Exception ex) {
-            return 0L;
-        } finally {
-            try { probe.close(); } catch (Exception ignored) {}
-        }
-    }
-
     private int computeIntraVideoSegmentCount(long durationUs) {
         if (durationUs < 5_000_000L) {
             return 1;
@@ -671,149 +663,6 @@ public class VideoSearchService {
         // Auto: one segment per ~4 seconds, capped at CPU core count.
         int byDuration = (int) Math.max(1L, durationUs / 4_000_000L);
         return Math.min(cores, byDuration);
-    }
-
-    private static QueryMode resolveMode(String normalizedQuery) {
-        if (containsColorKeyword(normalizedQuery)) {
-            return QueryMode.COLOR;
-        }
-        if (normalizedQuery.contains("szarvas") || normalizedQuery.contains("deer")) {
-            return QueryMode.DEER;
-        }
-        return QueryMode.MOTION;
-    }
-
-    private static boolean containsColorKeyword(String normalizedQuery) {
-        return normalizedQuery.contains("piros") || normalizedQuery.contains("red")
-                || normalizedQuery.contains("zold") || normalizedQuery.contains("green")
-                || normalizedQuery.contains("kek") || normalizedQuery.contains("blue");
-    }
-
-    private static ColorQuery resolveColorQuery(String normalizedQuery) {
-        boolean wantsRed = normalizedQuery.contains("piros") || normalizedQuery.contains("red");
-        boolean wantsGreen = normalizedQuery.contains("zold") || normalizedQuery.contains("green");
-        boolean wantsBlue = normalizedQuery.contains("kek") || normalizedQuery.contains("blue");
-        if (!wantsRed && !wantsGreen && !wantsBlue) {
-            wantsRed = true;
-        }
-        return new ColorQuery(wantsRed, wantsGreen, wantsBlue);
-    }
-
-    private static long sampleStepForMode(QueryMode mode, long durationUs) {
-        if (mode != QueryMode.DEER) {
-            return DEFAULT_SAMPLE_STEP_US;
-        }
-        if (durationUs >= 360_000_000L) {
-            return 350_000L;
-        }
-        if (durationUs >= 180_000_000L) {
-            return 250_000L;
-        }
-        return DEER_SAMPLE_STEP_US;
-    }
-
-    private static boolean isMatch(QueryMode mode, double score) {
-        return switch (mode) {
-            case COLOR -> score >= 0.14;
-            case DEER -> score >= 0.21;
-            case MOTION -> score >= 0.18;
-        };
-    }
-
-    private static List<SceneMatch> postProcessDeerMatches(List<SceneMatch> candidates) {
-        if (candidates.isEmpty()) {
-            return candidates;
-        }
-
-        List<SceneMatch> byTime = new ArrayList<>(candidates);
-        byTime.sort(Comparator.comparingDouble(SceneMatch::getTimestampSeconds));
-
-        List<SceneMatch> representatives = selectTemporalRepresentatives(byTime, DEER_CLUSTER_WINDOW_SECONDS);
-        representatives.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
-
-        double topScore = representatives.get(0).getConfidence();
-        double dynamicThreshold = clamp(topScore * 0.60, 0.19, 0.36);
-
-        List<SceneMatch> filtered = new ArrayList<>();
-        for (SceneMatch candidate : representatives) {
-            if (candidate.getConfidence() < dynamicThreshold && filtered.size() >= 3) {
-                continue;
-            }
-            if (isTooCloseInTime(filtered, candidate, 0.95)) {
-                continue;
-            }
-            filtered.add(candidate);
-            if (filtered.size() >= MAX_MATCHES) {
-                break;
-            }
-        }
-
-        if (filtered.isEmpty() && topScore >= 0.20) {
-            filtered.add(representatives.get(0));
-        }
-        return filtered;
-    }
-
-    private static List<SceneMatch> selectTemporalRepresentatives(List<SceneMatch> byTime, double clusterWindowSeconds) {
-        List<SceneMatch> representatives = new ArrayList<>();
-
-        SceneMatch earliestInCluster = null;
-        SceneMatch strongestInCluster = null;
-        double clusterStart = 0.0;
-
-        for (SceneMatch candidate : byTime) {
-            if (strongestInCluster == null) {
-                earliestInCluster = candidate;
-                strongestInCluster = candidate;
-                clusterStart = candidate.getTimestampSeconds();
-                continue;
-            }
-
-            if (candidate.getTimestampSeconds() - clusterStart <= clusterWindowSeconds) {
-                if (candidate.getConfidence() > strongestInCluster.getConfidence()) {
-                    strongestInCluster = candidate;
-                }
-                continue;
-            }
-
-            representatives.add(mergeClusterMatch(strongestInCluster, earliestInCluster));
-            earliestInCluster = candidate;
-            strongestInCluster = candidate;
-            clusterStart = candidate.getTimestampSeconds();
-        }
-
-        if (strongestInCluster != null && earliestInCluster != null) {
-            representatives.add(mergeClusterMatch(strongestInCluster, earliestInCluster));
-        }
-
-        return representatives;
-    }
-
-    private static SceneMatch mergeClusterMatch(SceneMatch strongest, SceneMatch earliest) {
-        return new SceneMatch(
-                earliest.getTimestampSeconds(),
-                strongest.getConfidence(),
-                strongest.getReason(),
-                strongest.getPreviewDataUrl()
-        );
-    }
-
-    private static boolean isTooCloseInTime(List<SceneMatch> selected, SceneMatch candidate, double minGapSeconds) {
-        for (SceneMatch existing : selected) {
-            if (Math.abs(existing.getTimestampSeconds() - candidate.getTimestampSeconds()) < minGapSeconds) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static long advanceSampleCursor(long timestampUs, long nextSampleUs, long sampleStepUs) {
-        long step = Math.max(1L, sampleStepUs);
-        long cursor = nextSampleUs;
-        do {
-            cursor += step;
-        } while (timestampUs >= cursor);
-        return cursor;
     }
 
     private static int normalizeThreadCount(int configuredThreadCount) {
@@ -1039,46 +888,6 @@ public class VideoSearchService {
         return clamp(blended, 0.0, 1.0);
     }
 
-    /**
-     * Prefer GPU decode when available (macOS: videotoolbox), then safely fall back to CPU.
-     * The pixel-wise analysis remains CPU-based in the current implementation.
-     */
-    private static void startGrabberWithGpuFallback(FFmpegFrameGrabber grabber,
-                                                    boolean decodeHwAccelEnabled,
-                                                    int decodeThreadCount) throws FFmpegFrameGrabber.Exception {
-        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-
-        String threadOption = decodeThreadCount <= 0 ? "0" : Integer.toString(Math.max(1, decodeThreadCount));
-        grabber.setOption("threads", threadOption);
-        if (!decodeHwAccelEnabled) {
-            grabber.setOption("hwaccel", "none");
-            grabber.start();
-            return;
-        }
-
-        if (os.contains("mac")) {
-            grabber.setOption("hwaccel", "videotoolbox");
-        } else if (os.contains("win")) {
-            grabber.setOption("hwaccel", "d3d11va");
-        } else {
-            grabber.setOption("hwaccel", "auto");
-        }
-
-        try {
-            grabber.start();
-            return;
-        } catch (FFmpegFrameGrabber.Exception ignored) {
-            try {
-                grabber.stop();
-            } catch (Exception ignoredStop) {
-                // no-op
-            }
-        }
-
-        grabber.setOption("hwaccel", "none");
-        grabber.start();
-    }
-
     private static double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
     }
@@ -1109,11 +918,6 @@ public class VideoSearchService {
             return name.substring(name.length() - 80);
         }
         return name;
-    }
-
-    private static String stripAccents(String value) {
-        String normalized = Normalizer.normalize(value, Normalizer.Form.NFD);
-        return normalized.replaceAll("\\p{M}", "");
     }
 
     private static BufferedImage scale(BufferedImage source, int maxWidth) {
@@ -1815,38 +1619,6 @@ public class VideoSearchService {
         return (r * 299 + g * 587 + b * 114) / 1000;
     }
 
-    private enum QueryMode {
-        COLOR,
-        DEER,
-        MOTION
-    }
-
-    private static final class ColorQuery {
-        private final boolean wantsRed;
-        private final boolean wantsGreen;
-        private final boolean wantsBlue;
-
-        private ColorQuery(boolean wantsRed, boolean wantsGreen, boolean wantsBlue) {
-            this.wantsRed = wantsRed;
-            this.wantsGreen = wantsGreen;
-            this.wantsBlue = wantsBlue;
-        }
-
-        private String displayName() {
-            List<String> names = new ArrayList<>();
-            if (wantsRed) {
-                names.add("piros");
-            }
-            if (wantsGreen) {
-                names.add("zold");
-            }
-            if (wantsBlue) {
-                names.add("kek");
-            }
-            return String.join("/", names);
-        }
-    }
-
     private static final class ColorStats {
         private final double redDominance;
         private final double greenDominance;
@@ -1865,13 +1637,13 @@ public class VideoSearchService {
 
         private double dominance(ColorQuery query) {
             double best = 0.0;
-            if (query.wantsRed) {
+            if (query.wantsRed()) {
                 best = Math.max(best, redDominance);
             }
-            if (query.wantsGreen) {
+            if (query.wantsGreen()) {
                 best = Math.max(best, greenDominance);
             }
-            if (query.wantsBlue) {
+            if (query.wantsBlue()) {
                 best = Math.max(best, blueDominance);
             }
             return best;
