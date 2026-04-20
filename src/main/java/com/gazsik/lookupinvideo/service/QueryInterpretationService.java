@@ -11,6 +11,90 @@ import java.util.Locale;
 @Service
 public class QueryInterpretationService {
 
+    // -------------------------------------------------------------------------
+    // Kulcsszó-csoportok intent-enként (szinonima + kontextus bővítés)
+    // Prioritásrend: COLOR > WILDLIFE > LANE_CHANGE > TURN >
+    //                CROSSING_VEHICLE > SUDDEN_STOP > OVERTAKE > ANOMALY >
+    //                ROAD_OBSTACLE > MOTION
+    // -------------------------------------------------------------------------
+
+    // COLOR — szín kulcsszavak
+    private static final String[] KW_COLOR = {
+        "piros", "red",
+        "zold", "green",
+        "kek", "blue"
+    };
+
+    // WILDLIFE — vadállat, szarvas, útátkelő állat
+    private static final String[] KW_WILDLIFE = {
+        "szarvas", "vad", "oz",                            // magyar
+        "deer", "wildlife", "animal",                      // angol alap
+        "wild animal", "animal crossing", "road animal",   // szinonimák
+        "animal on road", "roadside animal"                // kontextus
+    };
+
+    // LANE_CHANGE — sávváltás
+    private static final String[] KW_LANE_CHANGE = {
+        "savalt", "savvaltas", "besorol",                  // magyar
+        "kicsúszik a savbol", "atmegy masik savba",
+        "lane change", "lane_change", "changing lane",     // angol alap
+        "merge", "merging", "drift", "weaving"             // szinonimák
+    };
+
+    // TURN — kanyarodás
+    private static final String[] KW_TURN = {
+        "kanyar", "balra kanyar", "jobbra kanyar",         // magyar
+        "balra", "jobbra",
+        "turn", "turning", "left turn", "right turn",      // angol alap
+        "corner", "curve", "bend"                          // szinonimák
+    };
+
+    // CROSSING_VEHICLE — keresztbe menő jármű
+    private static final String[] KW_CROSSING_VEHICLE = {
+        "keresztbe", "keresztbe megy", "keresztezi",       // magyar
+        "athalad keresztben",
+        "crossing", "cross vehicle", "crossing vehicle",   // angol alap
+        "vehicle crossing", "crosses the road",            // szinonimák
+        "crossing traffic", "perpendicular motion",
+        "lateral crossing"
+    };
+
+    // SUDDEN_STOP — hirtelen megállás / elakadás
+    private static final String[] KW_SUDDEN_STOP = {
+        "megall", "hirtelen megall", "elakad",             // magyar
+        "allo jarmu", "blokkol",
+        "sudden stop", "stop", "halt", "stuck",            // angol alap
+        "blocking", "stationary object", "abrupt stop"     // szinonimák
+    };
+
+    // OVERTAKE — előzés / elhaladás
+    private static final String[] KW_OVERTAKE = {
+        "megeloz", "elhalad", "elozos", "kerules",         // magyar
+        "overtake", "overtaking", "pass",                  // angol alap
+        "passing vehicle", "pass-by", "pass by"            // szinonimák
+    };
+
+    // ANOMALY — szabálytalanság, veszélyes helyzet
+    private static final String[] KW_ANOMALY = {
+        "anomalia", "szabalytalan", "rendellenes",         // magyar
+        "veszely", "veszedelmes", "veszhelyzet",
+        "anomaly", "irregularity", "violation",            // angol alap
+        "wrong way", "wrong-way", "unsafe behavior",       // szinonimák
+        "illegal movement", "dangerous event",
+        "sudden movement", "hirtelen mozgas",
+        "abrupt motion", "gyors athaladasara",
+        "sudden appearance", "dash", "sprint"
+    };
+
+    // ROAD_OBSTACLE — útakadály
+    private static final String[] KW_ROAD_OBSTACLE = {
+        "akadaly", "uton akadaly", "utakadaly",            // magyar
+        "obstacle", "road obstacle",                       // angol alap
+        "debris", "fallen object", "road hazard"           // szinonimák
+    };
+
+    // -------------------------------------------------------------------------
+
     public SearchQueryInterpretation interpret(String rawQuery) {
         String safeQuery = rawQuery == null ? "" : rawQuery.trim();
         String normalizedQuery = normalizeQuery(safeQuery);
@@ -30,39 +114,36 @@ public class QueryInterpretationService {
     }
 
     public QueryIntent resolveIntent(String normalizedQuery) {
-        if (containsColorKeyword(normalizedQuery)) {
+        if (containsAny(normalizedQuery, KW_COLOR)) {
             return QueryIntent.COLOR;
         }
-
-        if (containsAny(normalizedQuery, "szarvas", "deer", "wildlife", "animal", "vad")) {
+        if (containsAny(normalizedQuery, KW_WILDLIFE)) {
             return QueryIntent.WILDLIFE;
         }
-
-        if (containsAny(normalizedQuery, "savalt", "savvaltas", "lane change", "lane_change")) {
+        if (containsAny(normalizedQuery, KW_LANE_CHANGE)) {
             return QueryIntent.LANE_CHANGE;
         }
-
-        if (containsAny(normalizedQuery, "kanyar", "turn", "balra", "jobbra")) {
+        if (containsAny(normalizedQuery, KW_TURN)) {
             return QueryIntent.TURN;
         }
-
-        if (containsAny(normalizedQuery, "keresztbe", "crossing", "cross vehicle", "crossing vehicle")) {
+        if (containsAny(normalizedQuery, KW_CROSSING_VEHICLE)) {
             return QueryIntent.CROSSING_VEHICLE;
         }
-
-        if (containsAny(normalizedQuery, "anomaly", "anomalia", "szabalytalan", "wrong way", "wrong-way", "veszely")) {
-            return QueryIntent.ANOMALY;
-        }
-
-        if (containsAny(normalizedQuery, "akadaly", "obstacle", "road obstacle")) {
+        // SUDDEN_STOP és OVERTAKE jelenleg ANOMALY ill. MOTION csoportba esnek,
+        // amíg dedikált intent nem kerül az enumba.
+        if (containsAny(normalizedQuery, KW_SUDDEN_STOP)) {
             return QueryIntent.ROAD_OBSTACLE;
         }
-
+        if (containsAny(normalizedQuery, KW_OVERTAKE)) {
+            return QueryIntent.CROSSING_VEHICLE;
+        }
+        if (containsAny(normalizedQuery, KW_ANOMALY)) {
+            return QueryIntent.ANOMALY;
+        }
+        if (containsAny(normalizedQuery, KW_ROAD_OBSTACLE)) {
+            return QueryIntent.ROAD_OBSTACLE;
+        }
         return QueryIntent.MOTION;
-    }
-
-    private static boolean containsColorKeyword(String normalizedQuery) {
-        return containsAny(normalizedQuery, "piros", "red", "zold", "green", "kek", "blue");
     }
 
     private static boolean containsAny(String text, String... keywords) {

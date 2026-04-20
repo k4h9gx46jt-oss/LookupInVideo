@@ -113,18 +113,76 @@ Ha nincs property megadva:
   - `analysisThreadCount * segsPerVideo`
   - `segsPerVideo = configuredSegmentCount > 0 ? configuredSegmentCount : 1`
 
-## 4. Keresesi modok (query -> QueryMode)
+## 4. Keresesi modok (query -> QueryIntent) — mit lehet beírni?
 
 `analyzeVideo(...)` elejen:
-1. `query` normalizalas: `stripAccents(query).toLowerCase(Locale.ROOT)`
-2. `resolveMode(normalizedQuery)`
+1. `query` normalizalas: ékezetek eltávolítása + kisbetűsítés (`Normalizer NFD + strip + toLowerCase`)
+2. `resolveIntent(normalizedQuery)` — az alábbi sorrendben, az ELSŐ illeszkedő mod aktivál
 
-Prioritas:
-1. `COLOR`: ha van `piros/red`, `zold/green`, `kek/blue`
-2. `DEER`: ha van `szarvas` vagy `deer`
-3. `MOTION`: minden mas
+---
 
-Fontos: ha query-ben szin es deer is van, a `COLOR` mod nyer (ez a kod szerinti prioritas).
+### 4.1 Keresési kulcsszavak táblázata (intent → kulcsszócsoport)
+
+| Intent               | Magyar kulcsszavak                                                                 | Angol kulcsszavak / szinonimák                                                                      | Mit keres?                                                   |
+|----------------------|------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
+| **COLOR**            | `piros`, `zold`, `kek`                                                             | `red`, `green`, `blue`                                                                              | Adott szín dominanciája a képen, mozgásboosttal              |
+| **WILDLIFE**         | `szarvas`, `vad`, `oz`                                                             | `deer`, `wildlife`, `animal`, `wild animal`, `animal crossing`, `road animal`, `animal on road`, `roadside animal` | Keresztirányú mozgás — szarvas/vad heurisztika  |
+| **LANE_CHANGE**      | `savalt`, `savvaltas`, `besorol`, `atmegy masik savba`, `kicsúszik a savbol`       | `lane change`, `lane_change`, `changing lane`, `merge`, `merging`, `drift`, `weaving`               | Sávváltás detektálása                                        |
+| **TURN**             | `kanyar`, `balra kanyar`, `jobbra kanyar`, `balra`, `jobbra`                       | `turn`, `turning`, `left turn`, `right turn`, `corner`, `curve`, `bend`                             | Kanyar-esemény                                               |
+| **CROSSING_VEHICLE** | `keresztbe`, `keresztbe megy`, `keresztezi`, `athalad keresztben`                  | `crossing`, `cross vehicle`, `crossing vehicle`, `vehicle crossing`, `crosses the road`, `crossing traffic`, `perpendicular motion`, `lateral crossing` | Keresztbe menő jármű |
+| **ROAD_OBSTACLE**    | `megall`, `hirtelen megall`, `elakad`, `allo jarmu`, `blokkol`, `akadaly`, `uton akadaly` | `sudden stop`, `stop`, `halt`, `stuck`, `blocking`, `stationary object`, `abrupt stop`, `obstacle`, `road obstacle`, `debris`, `fallen object`, `road hazard` | Megállás / elakadás / útakadály |
+| **ANOMALY**          | `anomalia`, `szabalytalan`, `rendellenes`, `veszely`, `veszedelmes`, `hirtelen mozgas` | `anomaly`, `irregularity`, `violation`, `wrong way`, `wrong-way`, `unsafe behavior`, `illegal movement`, `dangerous event`, `sudden movement`, `abrupt motion`, `sudden appearance`, `dash`, `sprint` | Szabálytalanság, veszélyes helyzet, hirtelen mozgás |
+| **MOTION**           | *(bármely más szó, pl. `mozgas`, `auto`, `elhalad`, `megeloz`)*                    | *(any other text, incl. `overtake`, `overtaking`, `pass`, `passing vehicle`, `pass-by`)*            | Általános mozgásintenzitás alapú keresés                     |
+
+> **Megjegyzés az előzésről / elhaladásról:** Az `overtake`, `megeloz`, `elhalad`, `pass-by` kulcsszavak
+> jelenleg a `MOTION` (általános mozgás) módot aktiválják, mivel dedikált overtake-detektor
+> még nincs implementálva.
+
+---
+
+### 4.2 Keresési példák
+
+| Beírt query                  | Aktivált intent      | Miért?                                             |
+|------------------------------|----------------------|----------------------------------------------------|
+| `szarvas`                    | WILDLIFE             | Direkt egyezés                                     |
+| `deer`                       | WILDLIFE             | Direkt egyezés                                     |
+| `wild animal`                | WILDLIFE             | Szinonima bővítés                                  |
+| `animal crossing`            | WILDLIFE             | Szinonima bővítés                                  |
+| `kanyar`                     | TURN                 | Magyar kulcsszó                                    |
+| `curve`                      | TURN                 | Szinonima                                          |
+| `sávváltás`                  | LANE_CHANGE          | Magyar kulcsszó (ékezet nélkül: `savvaltas`)       |
+| `merge`                      | LANE_CHANGE          | Szinonima                                          |
+| `keresztbe menő autó`        | CROSSING_VEHICLE     | Részleges egyezés (`keresztbe`)                    |
+| `lateral crossing`           | CROSSING_VEHICLE     | Szinonima                                          |
+| `wrong way`                  | ANOMALY              | Direkt egyezés                                     |
+| `szabálytalan mozgás`        | ANOMALY              | (`szabalytalan` egyezés)                           |
+| `hirtelen megáll`            | ROAD_OBSTACLE        | (`hirtelen megall` egyezés)                        |
+| `sudden stop`                | ROAD_OBSTACLE        | Szinonima                                          |
+| `piros autó`                 | COLOR (piros nyer!)  | Szín mindig elsőbbséget kap                        |
+| `piros szarvas`              | COLOR                | Szín > WILDLIFE — a `piros` nyer                  |
+| `mozgas`                     | MOTION               | Semmi sem illeszkedett → fallback                  |
+| `overtake`                   | MOTION               | Nincs dedikált intent → fallback                   |
+
+---
+
+### 4.3 Prioritásrend (ha több kulcsszó egyszerre szerepel)
+
+1. `COLOR` — a szín mindig nyer minden más felett
+2. `WILDLIFE`
+3. `LANE_CHANGE`
+4. `TURN`
+5. `CROSSING_VEHICLE`
+6. `ROAD_OBSTACLE` (ide esik a sudden stop is)
+7. `ANOMALY`
+8. `MOTION` — fallback, ha semmi sem illeszkedett
+
+---
+
+### 4.4 Megjegyzés a fallback modokról
+
+A `LANE_CHANGE`, `TURN`, `CROSSING_VEHICLE`, `ANOMALY`, `ROAD_OBSTACLE` intents jelenleg
+a mozgásintenzitás-alapú baseline-ra (`MOTION` logika) esnek vissza — dedikált eseménydetektoruk
+még nincs implementálva. A `WILDLIFE` és `COLOR` modok rendelkeznek valódi, célzott pipeline-nal.
 
 ## 5. Fo konstansok (algoritmus parameterek)
 
