@@ -690,6 +690,24 @@ public class VideoSearchService {
                                 lateralTrackScore * 100,
                                 vehicleColorSignal * 100
                         );
+                    } else if (intent == QueryIntent.TURN) {
+                        // Kanyarnal a kamera vizszintesen fordul, ezert |globalShiftX| nagy (max 8px),
+                        // egyenes haladásnal közel nulla. Ez jobb jelzo, mint a nyers intenzitas.
+                        double absX = Math.abs(motionMetrics.globalShiftX);
+                        double absY = Math.abs(motionMetrics.globalShiftY);
+                        // +1 denominator floor: shiftX=1 -> 0.50, shiftX=0 -> 0.0
+                        double horizDom = absX / (absX + absY + 1.0);
+                        // Minimum mozgaskapu: az auto haladjon (ne alljon)
+                        double motionGate = clamp(motionMetrics.intensity / 0.04, 0.0, 1.0);
+                        score = horizDom * motionGate;
+                        String turnDir = motionMetrics.globalShiftX > 1.5 ? "<- balra"
+                                : motionMetrics.globalShiftX < -1.5 ? "-> jobbra"
+                                : "egyenes/ismeretlen";
+                        reason = String.format(Locale.ROOT,
+                                "Kanyar-jel: %.1f%% [%s] | globShift=(%+.0f,%+.0f) | intenz=%.1f%%",
+                                score * 100, turnDir,
+                                motionMetrics.globalShiftX, motionMetrics.globalShiftY,
+                                motionMetrics.intensity * 100);
                     } else {
                         score = motionMetrics.intensity;
                         reason = String.format(Locale.ROOT, "Mozgas-intenzitas: %.1f%%", motionMetrics.intensity * 100);

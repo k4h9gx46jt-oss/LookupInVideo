@@ -11,6 +11,8 @@ public class EventScoringService {
         return switch (intent) {
             case COLOR -> score >= 0.14;
             case WILDLIFE -> score >= 0.21;
+            // TURN: horizDom * motionGate alapu jel, kanyarnal ~0.5-0.9, egyenesen ~0
+            case TURN -> score >= 0.40;
             default -> score >= 0.18;
         };
     }

@@ -10,6 +10,10 @@ public class FrameSampler {
     private static final long WILDLIFE_SAMPLE_STEP_US = 150_000L;
 
     public long computeSampleStepUs(QueryIntent intent, long durationUs) {
+        if (intent == QueryIntent.TURN || intent == QueryIntent.LANE_CHANGE) {
+            // Finer sampling to catch short turns and lane changes
+            return 500_000L;
+        }
         if (intent != QueryIntent.WILDLIFE) {
             return DEFAULT_SAMPLE_STEP_US;
         }
