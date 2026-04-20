@@ -68,6 +68,8 @@ public final class VideoSearchValidator {
             true,
             false,
             0,
+            0,
+            false,
             0
         );
         try {

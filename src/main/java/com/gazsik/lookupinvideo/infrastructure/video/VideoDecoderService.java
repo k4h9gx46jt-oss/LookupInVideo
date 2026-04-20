@@ -14,6 +14,10 @@ public class VideoDecoderService {
         try {
             probe.setOption("threads", "1");
             probe.setOption("hwaccel", "none");
+            // Prevent FFmpeg from spending too long detecting the stream format.
+            // Without these, a corrupted or unusual container can block start() for many minutes.
+            probe.setOption("analyzeduration", "2000000");  // max 2s format analysis
+            probe.setOption("probesize", "20000000");        // max 20MB header probe
             probe.start();
             long dur = Math.max(0L, probe.getLengthInTime());
             probe.stop();
@@ -36,6 +40,9 @@ public class VideoDecoderService {
 
         String threadOption = decodeThreadCount <= 0 ? "0" : Integer.toString(Math.max(1, decodeThreadCount));
         grabber.setOption("threads", threadOption);
+        // Limit format-detection time so a bad file cannot block a segment thread indefinitely.
+        grabber.setOption("analyzeduration", "5000000");  // max 5s
+        grabber.setOption("probesize", "30000000");        // max 30MB
         if (!decodeHwAccelEnabled) {
             grabber.setOption("hwaccel", "none");
             grabber.start();

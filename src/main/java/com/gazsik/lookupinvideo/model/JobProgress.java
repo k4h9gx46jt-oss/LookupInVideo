@@ -38,7 +38,14 @@ public class JobProgress {
     public int getPercent() {
         if (total <= 0) return 0;
         if (parallelMode) {
-            return Math.min(100, processed.get() * 100 / total);
+            double completed = processed.get();
+            double inFlight = 0.0;
+            for (Integer value : fileProgress.values()) {
+                int bounded = Math.max(0, Math.min(100, value == null ? 0 : value));
+                inFlight += bounded / 100.0;
+            }
+            int percent = (int) Math.round(((completed + inFlight) * 100.0) / total);
+            return Math.min(100, percent);
         }
         return Math.min(100, (int) ((processed.get() * 100L + framePercent) / total));
     }

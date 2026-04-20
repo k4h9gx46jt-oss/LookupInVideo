@@ -1,0 +1,9 @@
+profile_id,max_threads,intra_segments,decode_hwaccel,decode_threads,gpu_processing
+p01,10,7,true,4,true
+p02,12,7,true,2,false
+p03,14,6,false,2,false
+p04,16,5,false,1,false
+p05,18,4,false,1,false
+p06,12,8,true,1,false
+p07,14,7,false,4,false
+p08,10,10,false,1,false

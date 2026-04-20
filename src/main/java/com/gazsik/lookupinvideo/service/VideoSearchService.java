@@ -20,6 +20,8 @@ import org.bytedeco.opencv.opencv_core.Rect;
 import org.bytedeco.opencv.opencv_core.Scalar;
 import org.bytedeco.opencv.opencv_core.Size;
 import org.bytedeco.opencv.opencv_core.UMat;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -40,6 +42,7 @@ import com.gazsik.lookupinvideo.model.JobProgress;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -50,7 +53,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.bytedeco.javacpp.BytePointer;
@@ -73,6 +78,8 @@ import static org.bytedeco.opencv.global.opencv_imgproc.threshold;
 
 @Service
 public class VideoSearchService {
+
+    private static final Logger LOG = LoggerFactory.getLogger(VideoSearchService.class);
 
     private static final int ANALYSIS_WIDTH_CPU = 320;
     private static final int ANALYSIS_WIDTH_GPU = 512;
@@ -123,7 +130,9 @@ public class VideoSearchService {
     private final String gpuProcessingStatus;
     private final boolean decodeHwAccelEnabled;
     private final int decodeThreadCount;
+    private final int maxConcurrentGrabbers;
     private final int configuredSegmentCount;
+    private final boolean stageProfilingEnabled;
     private final QueryInterpretationService queryInterpretationService;
     private final FrameSampler frameSampler;
     private final VideoDecoderService videoDecoderService;
@@ -141,6 +150,8 @@ public class VideoSearchService {
                               @Value("${lookup.video.analysis.gpu-processing:true}") boolean gpuProcessingRequested,
                               @Value("${lookup.video.analysis.decode-hwaccel:false}") boolean decodeHwAccelEnabled,
                               @Value("${lookup.video.analysis.decode-threads:0}") int decodeThreadCount,
+                              @Value("${lookup.video.analysis.max-concurrent-grabbers:0}") int configuredMaxConcurrentGrabbers,
+                              @Value("${lookup.video.analysis.profile-stages:false}") boolean stageProfilingEnabled,
                               @Value("${lookup.video.analysis.intra-segment-count:0}") int configuredSegmentCount) throws IOException {
         try {
             avutil.av_log_set_level(avutil.AV_LOG_ERROR);
@@ -158,16 +169,22 @@ public class VideoSearchService {
         this.analysisThreadCount = normalizeThreadCount(configuredAnalysisThreads);
         this.analysisTimeoutSeconds = Math.max(MIN_ANALYSIS_TIMEOUT_SECONDS, configuredAnalysisTimeoutSeconds);
         this.configuredSegmentCount = Math.max(0, configuredSegmentCount);
+        int availableCores = Math.max(1, Runtime.getRuntime().availableProcessors());
+        this.maxConcurrentGrabbers = configuredMaxConcurrentGrabbers > 0
+            ? configuredMaxConcurrentGrabbers
+            : Math.max(availableCores * 2, this.analysisThreadCount);
         this.analysisExecutor = Executors.newFixedThreadPool(this.analysisThreadCount);
         // Pool must fit ALL analysis threads each running their full segment slice simultaneously.
         // Without this, analysis threads block each other waiting for the segment pool to free up,
         // so only 1-2 videos ever make real progress at once (the old pool-size-= bug).
         int segsPerVideo = this.configuredSegmentCount > 0 ? this.configuredSegmentCount : 1;
-        int segPoolSize = this.analysisThreadCount * segsPerVideo;
+        int segPoolDesired = this.analysisThreadCount * segsPerVideo;
+        int segPoolSize = Math.max(this.analysisThreadCount, Math.min(segPoolDesired, this.maxConcurrentGrabbers));
         this.segmentExecutor = Executors.newFixedThreadPool(segPoolSize);
         this.gpuProcessingEnabled = resolveGpuProcessingEnabled(gpuProcessingRequested);
         this.decodeHwAccelEnabled = decodeHwAccelEnabled;
         this.decodeThreadCount = decodeThreadCount;
+        this.stageProfilingEnabled = stageProfilingEnabled;
         this.gpuProcessingStatus = gpuProcessingRequested
             ? (this.gpuProcessingEnabled ? "OpenCL GPU aktiv" : "GPU nem elerheto, CPU fallback")
             : "GPU mod kikapcsolva (config)";
@@ -307,6 +324,7 @@ public class VideoSearchService {
 
         final String q = query == null ? "" : query.trim();
         final int total = videoFiles.size();
+        final long fileTimeoutSeconds = Math.max(60L, analysisTimeoutSeconds + 30L);
 
         List<CompletableFuture<SearchOutcome>> futures = videoFiles.stream()
                 .map(videoPath -> CompletableFuture.supplyAsync(() -> {
@@ -314,22 +332,31 @@ public class VideoSearchService {
                     String videoId = UUID.randomUUID().toString();
                     videoRegistry.put(videoId, videoPath);
                     progress.startFileTracking(fileName);
-                    try {
-                        SearchOutcome outcome = analyzeVideo(videoId, videoPath, q, fileName, progress);
-                        int matchCount = outcome.getMatches().isEmpty() ? 0 : outcome.getMatches().size();
-                        progress.fileCompleted(fileName, matchCount);
-                        return outcome.getMatches().isEmpty() ? null : outcome;
-                    } catch (Exception ex) {
+                    return analyzeVideo(videoId, videoPath, q, fileName, progress);
+                }, analysisExecutor)
+                .orTimeout(fileTimeoutSeconds, TimeUnit.SECONDS)
+                .handle((outcome, ex) -> {
+                    String fileName = videoPath.getFileName().toString();
+                    if (ex != null) {
+                        LOG.warn("Directory file analysis timeout/failure for file={} (timeout={}s): {}",
+                                fileName,
+                                fileTimeoutSeconds,
+                                ex.toString());
                         progress.fileCompleted(fileName, 0);
                         return null;
                     }
-                }, analysisExecutor))
+                    int matchCount = (outcome == null || outcome.getMatches().isEmpty())
+                            ? 0
+                            : outcome.getMatches().size();
+                    progress.fileCompleted(fileName, matchCount);
+                    return (outcome == null || outcome.getMatches().isEmpty()) ? null : outcome;
+                }))
                 .collect(Collectors.toList());
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .thenRun(() -> {
                     List<SearchOutcome> outcomes = futures.stream()
-                            .map(f -> { try { return f.get(); } catch (Exception e) { return null; } })
+                            .map(CompletableFuture::join)
                             .filter(Objects::nonNull)
                             .sorted(Comparator.comparing(SearchOutcome::getFileName))
                             .collect(Collectors.toList());
@@ -362,8 +389,14 @@ public class VideoSearchService {
         long sampleStepUs = frameSampler.computeSampleStepUs(intent, durationUs);
         int analysisWidth = gpuProcessingEnabled ? ANALYSIS_WIDTH_GPU : ANALYSIS_WIDTH_CPU;
         long analysisDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(analysisTimeoutSeconds);
+        StageProfiler profiler = stageProfilingEnabled
+            ? StageProfiler.enabled(videoId, fileName, intent.name(), 0)
+            : StageProfiler.disabled();
 
         int segmentCount = computeIntraVideoSegmentCount(durationUs);
+        int effectiveDecodeThreads = resolveEffectiveDecodeThreads(segmentCount);
+        boolean effectiveDecodeHwAccel = decodeHwAccelEnabled && segmentCount <= 2;
+        profiler.setSegmentCount(segmentCount);
         // Shared progress tracker: each slot holds how many microseconds segment i has processed.
         AtomicLong[] segProgUs = new AtomicLong[segmentCount];
         for (int i = 0; i < segmentCount; i++) segProgUs[i] = new AtomicLong(0L);
@@ -372,7 +405,8 @@ public class VideoSearchService {
         if (segmentCount <= 1) {
             matches = processVideoSegment(videoPath, 0L, Long.MAX_VALUE, durationUs,
                     intent, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
-                    progress, fileName, 0, segProgUs);
+                    progress, fileName, 0, segProgUs, profiler,
+                    effectiveDecodeHwAccel, effectiveDecodeThreads);
         } else {
             long segmentDuration = durationUs / segmentCount;
             List<CompletableFuture<List<SceneMatch>>> futures = new ArrayList<>();
@@ -383,15 +417,29 @@ public class VideoSearchService {
                 futures.add(CompletableFuture.supplyAsync(
                         () -> processVideoSegment(videoPath, startUs, endUs, durationUs,
                         intent, colorQuery, analysisWidth, sampleStepUs, analysisDeadlineNanos,
-                                progress, fileName, segIdx, segProgUs),
+                    progress, fileName, segIdx, segProgUs, profiler,
+                    effectiveDecodeHwAccel, effectiveDecodeThreads),
                         segmentExecutor));
             }
             matches = new ArrayList<>();
             for (CompletableFuture<List<SceneMatch>> future : futures) {
                 try {
-                    matches.addAll(future.get());
+                    long remainingNanos = analysisDeadlineNanos - System.nanoTime();
+                    if (remainingNanos <= 0) {
+                        future.cancel(true);
+                        continue;
+                    }
+                    matches.addAll(future.get(remainingNanos, TimeUnit.NANOSECONDS));
+                } catch (TimeoutException timeoutException) {
+                    future.cancel(true);
+                    LOG.warn("Segment timeout during analyzeVideo; canceled one segment for file={}", fileName);
                 } catch (Exception ignored) {
                     // Segment failure is non-fatal; continue with other segments.
+                }
+            }
+            for (CompletableFuture<List<SceneMatch>> future : futures) {
+                if (!future.isDone()) {
+                    future.cancel(true);
                 }
             }
         }
@@ -407,6 +455,8 @@ public class VideoSearchService {
         String modeLabel = eventScoringService.modeLabel(intent);
         String note = eventScoringService.modeNote(intent);
         note = note + " | " + gpuProcessingStatus + " | Szegmensek: " + segmentCount;
+
+        profiler.logSummary(durationUs, matches.size(), sampleStepUs, analysisWidth, gpuProcessingStatus);
 
         return new SearchOutcome(videoId, query, modeLabel, note, durationUs / 1_000_000.0, matches, fileName);
     }
@@ -424,7 +474,10 @@ public class VideoSearchService {
             JobProgress progress,
             String fileName,
             int segmentIndex,
-            AtomicLong[] segmentProgressUs) {
+            AtomicLong[] segmentProgressUs,
+            StageProfiler profiler,
+            boolean effectiveDecodeHwAccel,
+            int effectiveDecodeThreads) {
         List<SceneMatch> matches = new ArrayList<>();
         FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoPath.toFile());
         // Tell FFmpeg to rescale output frames to analysis width before returning to Java.
@@ -432,7 +485,7 @@ public class VideoSearchService {
         // dramatically reducing per-frame cost – especially important for skipped frames.
         grabber.setImageWidth(analysisWidth);
         try {
-            videoDecoderService.startGrabberWithGpuFallback(grabber, decodeHwAccelEnabled, decodeThreadCount);
+            videoDecoderService.startGrabberWithGpuFallback(grabber, effectiveDecodeHwAccel, effectiveDecodeThreads);
             // Seek to a warm-up window before the actual segment start so the EMA,
             // longitudinal axis, and deer-track state are primed before emitting matches.
             long warmupStartUs = (segmentStartUs > 0L)
@@ -455,188 +508,215 @@ public class VideoSearchService {
             long nextSampleUs = warmupStartUs;
 
             Frame frame;
-            while ((frame = grabber.grabImage()) != null) {
-                if (Thread.currentThread().isInterrupted()) break;
-                if (System.nanoTime() > analysisDeadlineNanos) break;
-
-                long timestampUs = Math.max(grabber.getTimestamp(), 0L);
-                if (segmentEndUs != Long.MAX_VALUE && timestampUs >= segmentEndUs) break;
-
-                if (progress != null && fullVideoDurationUs > 0 && segmentProgressUs != null) {
-                    // Update this segment's share monotonically (never go backward).
-                    long localUs = Math.max(0L, timestampUs - Math.max(0L, segmentStartUs));
-                    segmentProgressUs[segmentIndex].accumulateAndGet(localUs, Math::max);
-                    // Sum all segments to get a stable, never-decreasing overall percent.
-                    long totalUs = 0L;
-                    for (AtomicLong al : segmentProgressUs) totalUs += al.get();
-                    int percent = (int) Math.min(99L, totalUs * 100L / fullVideoDurationUs);
-                    progress.updateFileFrame(fileName, percent);
-                }
-                if (timestampUs < nextSampleUs) {
-                    continue;
+            while (true) {
+                long grabStarted = System.nanoTime();
+                frame = grabber.grabImage();
+                profiler.addGrabDecodeNs(System.nanoTime() - grabStarted);
+                if (frame == null) {
+                    break;
                 }
 
-                Mat frameMat = matConverter.convert(frame);
-                if (frameMat == null || frameMat.empty()) {
-                    continue;
-                }
-                Mat scaledMat = scale(frameMat, analysisWidth);
-                if (scaledMat == null || scaledMat.empty()) {
-                    continue;
-                }
-                ColorStats colorStats = computeColorStats(scaledMat);
+                long loopStarted = System.nanoTime();
+                profiler.incrementFramesSeen();
 
-                MotionMetrics motionMetrics = previousSampleMat == null
-                        ? MotionMetrics.empty()
-                        : computeMotionMetricsWithBackend(
-                                previousSampleMat,
-                                scaledMat,
-                                previousResidualCentroidX,
-                                previousResidualCentroidY,
-                                longitudinalAxisX,
-                                longitudinalAxisY
+                try {
+                    if (Thread.currentThread().isInterrupted()) break;
+                    if (System.nanoTime() > analysisDeadlineNanos) break;
+
+                    long timestampUs = Math.max(grabber.getTimestamp(), 0L);
+                    if (segmentEndUs != Long.MAX_VALUE && timestampUs >= segmentEndUs) break;
+
+                    if (progress != null && fullVideoDurationUs > 0 && segmentProgressUs != null) {
+                        long progressStarted = System.nanoTime();
+                        // Update this segment's share monotonically (never go backward).
+                        long localUs = Math.max(0L, timestampUs - Math.max(0L, segmentStartUs));
+                        segmentProgressUs[segmentIndex].accumulateAndGet(localUs, Math::max);
+                        // Sum all segments to get a stable, never-decreasing overall percent.
+                        long totalUs = 0L;
+                        for (AtomicLong al : segmentProgressUs) totalUs += al.get();
+                        int percent = (int) Math.min(99L, totalUs * 100L / fullVideoDurationUs);
+                        progress.updateFileFrame(fileName, percent);
+                        profiler.addProgressUpdateNs(System.nanoTime() - progressStarted);
+                    }
+                    if (timestampUs < nextSampleUs) {
+                        continue;
+                    }
+
+                    profiler.incrementFramesSampled();
+
+                    long prepStarted = System.nanoTime();
+                    Mat frameMat = matConverter.convert(frame);
+                    if (frameMat == null || frameMat.empty()) {
+                        continue;
+                    }
+                    Mat scaledMat = scale(frameMat, analysisWidth);
+                    if (scaledMat == null || scaledMat.empty()) {
+                        continue;
+                    }
+                    ColorStats colorStats = computeColorStats(scaledMat);
+                    profiler.addConvertScaleColorNs(System.nanoTime() - prepStarted);
+
+                    long motionStarted = System.nanoTime();
+                    MotionMetrics motionMetrics = previousSampleMat == null
+                            ? MotionMetrics.empty()
+                            : computeMotionMetricsWithBackend(
+                                    previousSampleMat,
+                                    scaledMat,
+                                    previousResidualCentroidX,
+                                    previousResidualCentroidY,
+                                    longitudinalAxisX,
+                                    longitudinalAxisY
+                            );
+                    profiler.addMotionNs(System.nanoTime() - motionStarted);
+                    previousResidualCentroidX = motionMetrics.centroidX;
+                    previousResidualCentroidY = motionMetrics.centroidY;
+
+                    double shiftMagnitude = Math.hypot(motionMetrics.globalShiftX, motionMetrics.globalShiftY);
+                    if (shiftMagnitude >= 0.45) {
+                        double shiftUnitX = motionMetrics.globalShiftX / shiftMagnitude;
+                        double shiftUnitY = motionMetrics.globalShiftY / shiftMagnitude;
+                        longitudinalAxisX = longitudinalAxisX * 0.88 + shiftUnitX * 0.12;
+                        longitudinalAxisY = longitudinalAxisY * 0.88 + shiftUnitY * 0.12;
+                        double axisMagnitude = Math.hypot(longitudinalAxisX, longitudinalAxisY);
+                        if (axisMagnitude > 1e-6) {
+                            longitudinalAxisX /= axisMagnitude;
+                            longitudinalAxisY /= axisMagnitude;
+                        }
+                    }
+
+                    double burstBase = eventScoringService.usesWildlifePath(intent)
+                            ? motionMetrics.residualIntensity
+                            : motionMetrics.intensity;
+                    double burstScore = Math.max(0.0, burstBase - motionEma);
+                    motionEma = motionEma == 0.0
+                            ? burstBase
+                            : (motionEma * 0.85 + burstBase * 0.15);
+                    double activeGrowth = Double.isNaN(previousActiveRatio)
+                            ? 0.0
+                            : Math.max(0.0, motionMetrics.activeRatio - previousActiveRatio);
+                    previousActiveRatio = motionMetrics.activeRatio;
+
+                    double axisNormNow = Math.hypot(longitudinalAxisX, longitudinalAxisY);
+                    double axisXNow = axisNormNow < 1e-6 ? 0.0 : longitudinalAxisX / axisNormNow;
+                    double axisYNow = axisNormNow < 1e-6 ? 1.0 : longitudinalAxisY / axisNormNow;
+                    double lateralTrackScore = 0.0;
+                    if (eventScoringService.usesWildlifePath(intent)) {
+                        lateralTrackScore = computeLateralTrackScore(
+                                deerTrack,
+                                timestampUs / 1_000_000.0,
+                                motionMetrics,
+                                axisXNow,
+                                axisYNow
                         );
-                previousResidualCentroidX = motionMetrics.centroidX;
-                previousResidualCentroidY = motionMetrics.centroidY;
-
-                double shiftMagnitude = Math.hypot(motionMetrics.globalShiftX, motionMetrics.globalShiftY);
-                if (shiftMagnitude >= 0.45) {
-                    double shiftUnitX = motionMetrics.globalShiftX / shiftMagnitude;
-                    double shiftUnitY = motionMetrics.globalShiftY / shiftMagnitude;
-                    longitudinalAxisX = longitudinalAxisX * 0.88 + shiftUnitX * 0.12;
-                    longitudinalAxisY = longitudinalAxisY * 0.88 + shiftUnitY * 0.12;
-                    double axisMagnitude = Math.hypot(longitudinalAxisX, longitudinalAxisY);
-                    if (axisMagnitude > 1e-6) {
-                        longitudinalAxisX /= axisMagnitude;
-                        longitudinalAxisY /= axisMagnitude;
                     }
-                }
+                    if (previousSampleMat != null) {
+                        previousSampleMat.release();
+                    }
+                    previousSampleMat = scaledMat.clone();
+                    scaledMat.release();
 
-                double burstBase = eventScoringService.usesWildlifePath(intent)
-                        ? motionMetrics.residualIntensity
-                        : motionMetrics.intensity;
-                double burstScore = Math.max(0.0, burstBase - motionEma);
-                motionEma = motionEma == 0.0
-                        ? burstBase
-                        : (motionEma * 0.85 + burstBase * 0.15);
-                double activeGrowth = Double.isNaN(previousActiveRatio)
-                        ? 0.0
-                        : Math.max(0.0, motionMetrics.activeRatio - previousActiveRatio);
-                previousActiveRatio = motionMetrics.activeRatio;
+                    long scoringStarted = System.nanoTime();
+                    double score;
+                    String reason;
 
-                double axisNormNow = Math.hypot(longitudinalAxisX, longitudinalAxisY);
-                double axisXNow = axisNormNow < 1e-6 ? 0.0 : longitudinalAxisX / axisNormNow;
-                double axisYNow = axisNormNow < 1e-6 ? 1.0 : longitudinalAxisY / axisNormNow;
-                double lateralTrackScore = 0.0;
-                if (eventScoringService.usesWildlifePath(intent)) {
-                    lateralTrackScore = computeLateralTrackScore(
-                            deerTrack,
-                            timestampUs / 1_000_000.0,
-                            motionMetrics,
-                            axisXNow,
-                            axisYNow
-                    );
-                }
-                if (previousSampleMat != null) {
-                    previousSampleMat.release();
-                }
-                previousSampleMat = scaledMat.clone();
-                scaledMat.release();
+                    if (intent == QueryIntent.COLOR) {
+                        double colorDominance = colorStats.dominance(colorQuery);
+                        double colorMotionBoost = clamp((motionMetrics.residualIntensity - 0.010) / 0.070, 0.0, 1.0);
+                        score = clamp(colorDominance * 0.78 + colorMotionBoost * 0.22, 0.0, 1.0);
+                        reason = String.format(
+                                Locale.ROOT,
+                                "Szindominancia (%s): %.1f%% | Mozgas-boost: %.1f%%",
+                                colorQuery.displayName(),
+                                colorDominance * 100,
+                                colorMotionBoost * 100
+                        );
+                    } else if (eventScoringService.usesWildlifePath(intent)) {
+                        double vehicleColorSignal = Math.max(colorStats.redDominance, colorStats.blueDominance);
+                        double neutralSignal = colorStats.neutralDominance;
+                        boolean strongCrossingCandidate = lateralTrackScore >= 0.78
+                                && motionMetrics.crossMotionRatio >= 0.48
+                                && motionMetrics.residualIntensity >= 0.020
+                                && vehicleColorSignal < 0.20;
+                        boolean crossingCore = lateralTrackScore >= 0.70
+                                && motionMetrics.crossMotionRatio >= 0.40;
+                        boolean likelyRoadVehicleByColor = vehicleColorSignal >= 0.20
+                                && motionMetrics.centerRatio >= 0.30
+                                && motionMetrics.residualIntensity >= 0.030;
 
-                double score;
-                String reason;
+                        if (!crossingCore) {
+                            continue;
+                        }
+                        if (likelyRoadVehicleByColor && !strongCrossingCandidate) {
+                            continue;
+                        }
+                        if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
+                                || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)) {
+                            continue;
+                        }
+                        if (!strongCrossingCandidate
+                                && (looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
+                                || looksLikeLowCrossHighTrackVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                                || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
+                                || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
+                                || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
+                                || looksLikeColorfulMidLateralRoadVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                                || looksLikeHighLateralRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                                || looksLikeColoredRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
+                                || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal))) {
+                            continue;
+                        }
+                        score = computeDeerScore(
+                                motionMetrics,
+                                burstScore,
+                                activeGrowth,
+                                lateralTrackScore,
+                                vehicleColorSignal,
+                                colorStats.neutralDominance
+                        );
+                        reason = String.format(
+                                Locale.ROOT,
+                                "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%% | Oldalpalya: %.1f%% | Autoszin: %.1f%%",
+                                score * 100,
+                                motionMetrics.crossMotionRatio * 100,
+                                motionMetrics.residualIntensity * 100,
+                                motionMetrics.centerRatio * 100,
+                                lateralTrackScore * 100,
+                                vehicleColorSignal * 100
+                        );
+                    } else {
+                        score = motionMetrics.intensity;
+                        reason = String.format(Locale.ROOT, "Mozgas-intenzitas: %.1f%%", motionMetrics.intensity * 100);
+                    }
+                    profiler.addScoringNs(System.nanoTime() - scoringStarted);
 
-                if (intent == QueryIntent.COLOR) {
-                    double colorDominance = colorStats.dominance(colorQuery);
-                    double colorMotionBoost = clamp((motionMetrics.residualIntensity - 0.010) / 0.070, 0.0, 1.0);
-                    score = clamp(colorDominance * 0.78 + colorMotionBoost * 0.22, 0.0, 1.0);
-                    reason = String.format(
-                            Locale.ROOT,
-                            "Szindominancia (%s): %.1f%% | Mozgas-boost: %.1f%%",
-                            colorQuery.displayName(),
-                            colorDominance * 100,
-                            colorMotionBoost * 100
-                    );
-                } else if (eventScoringService.usesWildlifePath(intent)) {
-                    double vehicleColorSignal = Math.max(colorStats.redDominance, colorStats.blueDominance);
-                    double neutralSignal = colorStats.neutralDominance;
-                    boolean strongCrossingCandidate = lateralTrackScore >= 0.78
-                            && motionMetrics.crossMotionRatio >= 0.48
-                            && motionMetrics.residualIntensity >= 0.020
-                            && vehicleColorSignal < 0.20;
-                    boolean crossingCore = lateralTrackScore >= 0.70
-                            && motionMetrics.crossMotionRatio >= 0.40;
-                    boolean likelyRoadVehicleByColor = vehicleColorSignal >= 0.20
-                            && motionMetrics.centerRatio >= 0.30
-                            && motionMetrics.residualIntensity >= 0.030;
+                    nextSampleUs = frameSampler.advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
 
-                    if (!crossingCore) {
+                    // During the warm-up window, update state but don't emit matches.
+                    if (timestampUs < segmentStartUs) {
                         continue;
                     }
-                    if (likelyRoadVehicleByColor && !strongCrossingCandidate) {
+
+                    if (!eventScoringService.isMatch(intent, score)) {
                         continue;
                     }
-                    if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
-                            || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)) {
+
+                    long previewStarted = System.nanoTime();
+                    BufferedImage image = converter.convert(frame);
+                    if (image == null) {
                         continue;
                     }
-                    if (!strongCrossingCandidate
-                            && (looksLikeCenteredLowLateralVehicle(motionMetrics, lateralTrackScore)
-                            || looksLikeLowCrossHighTrackVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                            || looksLikeOvertrackedRoadFlow(motionMetrics, lateralTrackScore)
-                            || looksLikeCenterApproach(motionMetrics, lateralTrackScore)
-                            || looksLikeVehicleColorBlob(motionMetrics, colorStats, lateralTrackScore)
-                            || looksLikeColorfulMidLateralRoadVehicle(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                            || looksLikeHighLateralRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                            || looksLikeColoredRoadSweep(motionMetrics, lateralTrackScore, vehicleColorSignal)
-                            || looksLikeRoadVehicleProfile(motionMetrics, lateralTrackScore, vehicleColorSignal, neutralSignal))) {
-                        continue;
+                    String preview = createPreviewDataUrl(image);
+                    profiler.addPreviewNs(System.nanoTime() - previewStarted);
+                    double timestampSeconds = timestampUs / 1_000_000.0;
+                    if (eventScoringService.usesWildlifePath(intent)) {
+                        double deerLeadSeconds = computeDeerTimestampLeadSeconds(motionMetrics, lateralTrackScore, score);
+                        timestampSeconds = Math.max(0.0, timestampSeconds - deerLeadSeconds);
                     }
-                    score = computeDeerScore(
-                            motionMetrics,
-                            burstScore,
-                            activeGrowth,
-                            lateralTrackScore,
-                            vehicleColorSignal,
-                            colorStats.neutralDominance
-                    );
-                    reason = String.format(
-                            Locale.ROOT,
-                            "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%% | Oldalpalya: %.1f%% | Autoszin: %.1f%%",
-                            score * 100,
-                            motionMetrics.crossMotionRatio * 100,
-                            motionMetrics.residualIntensity * 100,
-                            motionMetrics.centerRatio * 100,
-                            lateralTrackScore * 100,
-                            vehicleColorSignal * 100
-                    );
-                } else {
-                    score = motionMetrics.intensity;
-                    reason = String.format(Locale.ROOT, "Mozgas-intenzitas: %.1f%%", motionMetrics.intensity * 100);
+                    matches.add(new SceneMatch(timestampSeconds, score, reason, preview));
+                    profiler.incrementMatchesEmitted();
+                } finally {
+                    profiler.addLoopNs(System.nanoTime() - loopStarted);
                 }
-
-                nextSampleUs = frameSampler.advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
-
-                // During the warm-up window, update state but don't emit matches.
-                if (timestampUs < segmentStartUs) {
-                    continue;
-                }
-
-                if (!eventScoringService.isMatch(intent, score)) {
-                    continue;
-                }
-
-                BufferedImage image = converter.convert(frame);
-                if (image == null) {
-                    continue;
-                }
-                String preview = createPreviewDataUrl(image);
-                double timestampSeconds = timestampUs / 1_000_000.0;
-                if (eventScoringService.usesWildlifePath(intent)) {
-                    double deerLeadSeconds = computeDeerTimestampLeadSeconds(motionMetrics, lateralTrackScore, score);
-                    timestampSeconds = Math.max(0.0, timestampSeconds - deerLeadSeconds);
-                }
-                matches.add(new SceneMatch(timestampSeconds, score, reason, preview));
             }
 
             if (previousSampleMat != null) {
@@ -655,14 +735,31 @@ public class VideoSearchService {
         if (durationUs < 5_000_000L) {
             return 1;
         }
+        int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int maxSegByGrabberLimit = Math.max(1, maxConcurrentGrabbers / Math.max(1, analysisThreadCount));
+
         if (configuredSegmentCount > 0) {
             // Explicit override from application.properties.
-            return configuredSegmentCount;
+            return Math.max(1, Math.min(configuredSegmentCount, maxSegByGrabberLimit));
         }
-        int cores = Runtime.getRuntime().availableProcessors();
         // Auto: one segment per ~4 seconds, capped at CPU core count.
         int byDuration = (int) Math.max(1L, durationUs / 4_000_000L);
-        return Math.min(cores, byDuration);
+        int autoSegments = Math.min(cores, byDuration);
+        return Math.max(1, Math.min(autoSegments, maxSegByGrabberLimit));
+    }
+
+    private int resolveEffectiveDecodeThreads(int segmentCount) {
+        int requested = decodeThreadCount <= 0 ? 1 : Math.max(1, decodeThreadCount);
+        int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
+        long concurrentGrabbers = (long) Math.max(1, analysisThreadCount) * Math.max(1, segmentCount);
+
+        if (concurrentGrabbers >= cores) {
+            return 1;
+        }
+        if (concurrentGrabbers * requested > (long) cores * 2L) {
+            return 1;
+        }
+        return requested;
     }
 
     private static int normalizeThreadCount(int configuredThreadCount) {
@@ -1617,6 +1714,166 @@ public class VideoSearchService {
         int g = (rgb >> 8) & 0xFF;
         int b = rgb & 0xFF;
         return (r * 299 + g * 587 + b * 114) / 1000;
+    }
+
+    private static final class StageProfiler {
+        private final boolean enabled;
+        private final String videoId;
+        private final String fileName;
+        private final String intent;
+        private volatile int segmentCount;
+
+        private final LongAdder framesSeen = new LongAdder();
+        private final LongAdder framesSampled = new LongAdder();
+        private final LongAdder matchesEmitted = new LongAdder();
+
+        private final LongAdder loopNs = new LongAdder();
+        private final LongAdder grabDecodeNs = new LongAdder();
+        private final LongAdder convertScaleColorNs = new LongAdder();
+        private final LongAdder motionNs = new LongAdder();
+        private final LongAdder scoringNs = new LongAdder();
+        private final LongAdder previewNs = new LongAdder();
+        private final LongAdder progressUpdateNs = new LongAdder();
+
+        private StageProfiler(boolean enabled, String videoId, String fileName, String intent, int segmentCount) {
+            this.enabled = enabled;
+            this.videoId = videoId;
+            this.fileName = fileName;
+            this.intent = intent;
+            this.segmentCount = segmentCount;
+        }
+
+        private static StageProfiler enabled(String videoId, String fileName, String intent, int segmentCount) {
+            return new StageProfiler(true, videoId, fileName, intent, segmentCount);
+        }
+
+        private static StageProfiler disabled() {
+            return new StageProfiler(false, "", "", "", 0);
+        }
+
+        private void setSegmentCount(int segmentCount) {
+            if (!enabled) {
+                return;
+            }
+            this.segmentCount = segmentCount;
+        }
+
+        private void incrementFramesSeen() {
+            if (enabled) {
+                framesSeen.increment();
+            }
+        }
+
+        private void incrementFramesSampled() {
+            if (enabled) {
+                framesSampled.increment();
+            }
+        }
+
+        private void incrementMatchesEmitted() {
+            if (enabled) {
+                matchesEmitted.increment();
+            }
+        }
+
+        private void addLoopNs(long value) {
+            if (enabled) {
+                loopNs.add(value);
+            }
+        }
+
+        private void addGrabDecodeNs(long value) {
+            if (enabled) {
+                grabDecodeNs.add(value);
+            }
+        }
+
+        private void addConvertScaleColorNs(long value) {
+            if (enabled) {
+                convertScaleColorNs.add(value);
+            }
+        }
+
+        private void addMotionNs(long value) {
+            if (enabled) {
+                motionNs.add(value);
+            }
+        }
+
+        private void addScoringNs(long value) {
+            if (enabled) {
+                scoringNs.add(value);
+            }
+        }
+
+        private void addPreviewNs(long value) {
+            if (enabled) {
+                previewNs.add(value);
+            }
+        }
+
+        private void addProgressUpdateNs(long value) {
+            if (enabled) {
+                progressUpdateNs.add(value);
+            }
+        }
+
+        private void logSummary(long durationUs,
+                                int finalMatches,
+                                long sampleStepUs,
+                                int analysisWidth,
+                                String gpuStatus) {
+            if (!enabled) {
+                return;
+            }
+
+            long totalLoopNs = loopNs.sum();
+            if (totalLoopNs <= 0) {
+                return;
+            }
+
+            LinkedHashMap<String, Long> stageNs = new LinkedHashMap<>();
+            stageNs.put("grabDecode", grabDecodeNs.sum());
+            stageNs.put("convertScaleColor", convertScaleColorNs.sum());
+            stageNs.put("motion", motionNs.sum());
+            stageNs.put("scoring", scoringNs.sum());
+            stageNs.put("preview", previewNs.sum());
+            stageNs.put("progressUpdate", progressUpdateNs.sum());
+
+            String topStages = stageNs.entrySet()
+                    .stream()
+                    .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
+                    .limit(3)
+                    .map(entry -> entry.getKey()
+                            + "="
+                            + String.format(Locale.ROOT, "%.1f%%", entry.getValue() * 100.0 / totalLoopNs)
+                            + "(" + String.format(Locale.ROOT, "%.1f", entry.getValue() / 1_000_000.0) + "ms)")
+                    .collect(Collectors.joining(", "));
+
+            LOG.info(
+                    "ANALYSIS_STAGE_PROFILE videoId={} file={} intent={} segments={} durationSec={} sampleStepMs={} analysisWidth={} gpuStatus='{}' framesSeen={} framesSampled={} matchesEmitted={} finalMatches={} topStages=[{}] totalsMs(loop={} grabDecode={} prep={} motion={} scoring={} preview={} progress={})",
+                    videoId,
+                    fileName,
+                    intent,
+                    segmentCount,
+                    String.format(Locale.ROOT, "%.2f", durationUs / 1_000_000.0),
+                    String.format(Locale.ROOT, "%.2f", sampleStepUs / 1000.0),
+                    analysisWidth,
+                    gpuStatus,
+                    framesSeen.sum(),
+                    framesSampled.sum(),
+                    matchesEmitted.sum(),
+                    finalMatches,
+                    topStages,
+                    String.format(Locale.ROOT, "%.1f", totalLoopNs / 1_000_000.0),
+                    String.format(Locale.ROOT, "%.1f", grabDecodeNs.sum() / 1_000_000.0),
+                    String.format(Locale.ROOT, "%.1f", convertScaleColorNs.sum() / 1_000_000.0),
+                    String.format(Locale.ROOT, "%.1f", motionNs.sum() / 1_000_000.0),
+                    String.format(Locale.ROOT, "%.1f", scoringNs.sum() / 1_000_000.0),
+                    String.format(Locale.ROOT, "%.1f", previewNs.sum() / 1_000_000.0),
+                    String.format(Locale.ROOT, "%.1f", progressUpdateNs.sum() / 1_000_000.0)
+            );
+        }
     }
 
     private static final class ColorStats {

@@ -1,0 +1,1 @@
+Ezt megcsináltam, kb. ezek lettek a megvalósítások. 
