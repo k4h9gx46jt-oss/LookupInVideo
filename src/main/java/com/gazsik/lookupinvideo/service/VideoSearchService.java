@@ -393,7 +393,7 @@ public class VideoSearchService {
             ? StageProfiler.enabled(videoId, fileName, intent.name(), 0)
             : StageProfiler.disabled();
 
-        int segmentCount = computeIntraVideoSegmentCount(durationUs);
+        int segmentCount = computeIntraVideoSegmentCount(intent, durationUs);
         int effectiveDecodeThreads = resolveEffectiveDecodeThreads(segmentCount);
         boolean effectiveDecodeHwAccel = decodeHwAccelEnabled && segmentCount <= 2;
         profiler.setSegmentCount(segmentCount);
@@ -541,6 +541,13 @@ public class VideoSearchService {
                     if (timestampUs < nextSampleUs) {
                         continue;
                     }
+                    // Advance the cursor immediately so every processed frame "consumes" one
+                    // sample slot — regardless of whether it passes downstream filters.
+                    // Without this, frames rejected by deer filters (continue) leave nextSampleUs
+                    // unchanged, causing the next 30fps frame to re-enter the full pipeline.
+                    // Result was: all 30fps frames processed instead of the intended ~7/sec,
+                    // motionEma updated at 33ms intervals instead of 150ms, deer scores wrong.
+                    nextSampleUs = frameSampler.advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
 
                     profiler.incrementFramesSampled();
 
@@ -689,8 +696,6 @@ public class VideoSearchService {
                     }
                     profiler.addScoringNs(System.nanoTime() - scoringStarted);
 
-                    nextSampleUs = frameSampler.advanceSampleCursor(timestampUs, nextSampleUs, sampleStepUs);
-
                     // During the warm-up window, update state but don't emit matches.
                     if (timestampUs < segmentStartUs) {
                         continue;
@@ -731,7 +736,14 @@ public class VideoSearchService {
         return matches;
     }
 
-    private int computeIntraVideoSegmentCount(long durationUs) {
+    private int computeIntraVideoSegmentCount(QueryIntent intent, long durationUs) {
+        // WILDLIFE detection relies on continuous temporal state (deerTrack, motionEma,
+        // longitudinalAxis). Splitting the video resets this state at each segment boundary,
+        // making the lateralTrackScore never build up — deer crossings are missed entirely.
+        // Use a single sequential pass for wildlife so tracking history accumulates correctly.
+        if (intent == QueryIntent.WILDLIFE) {
+            return 1;
+        }
         if (durationUs < 5_000_000L) {
             return 1;
         }
