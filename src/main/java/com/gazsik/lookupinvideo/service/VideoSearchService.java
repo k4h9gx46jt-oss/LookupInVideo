@@ -471,6 +471,15 @@ public class VideoSearchService {
 
         matches = eventPostProcessor.postProcess(intent, matches);
 
+        // EventPostProcessor.postProcess returns List.of() for empty inputs (immutable).
+        // Wrap in a mutable ArrayList before sorting; otherwise .sort() on List.of()
+        // throws UnsupportedOperationException for every video that produces zero matches —
+        // which is the common case for directory searches and was the real cause of the
+        // mass "Directory file analysis timeout/failure" warnings.
+        if (!(matches instanceof ArrayList)) {
+            matches = new ArrayList<>(matches);
+        }
+
         matches.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
         if (matches.size() > MAX_MATCHES) {
             matches = new ArrayList<>(matches.subList(0, MAX_MATCHES));
