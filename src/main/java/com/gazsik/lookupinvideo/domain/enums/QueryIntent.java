@@ -8,5 +8,6 @@ public enum QueryIntent {
     LANE_CHANGE,
     CROSSING_VEHICLE,
     ANOMALY,
-    ROAD_OBSTACLE
+    ROAD_OBSTACLE,
+    ONCOMING_TRUCK
 }

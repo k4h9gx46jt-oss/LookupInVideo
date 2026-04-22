@@ -26,6 +26,11 @@ public class FrameSampler {
             // Stop / stationary detection compares against a longer EMA, 0.5 s is enough
             return 500_000L;
         }
+        if (intent == QueryIntent.ONCOMING_TRUCK) {
+            // Approaching truck silhouette grows over a few seconds — 0.4 s is enough
+            // resolution to track the centroid stay-in-place + size growth.
+            return 400_000L;
+        }
         if (intent != QueryIntent.WILDLIFE) {
             return DEFAULT_SAMPLE_STEP_US;
         }

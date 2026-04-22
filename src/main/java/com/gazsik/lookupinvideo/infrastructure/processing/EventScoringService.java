@@ -21,6 +21,9 @@ public class EventScoringService {
             case ROAD_OBSTACLE -> score >= 0.32;
             // ANOMALY: burst-szeru, hirtelen-mozgasos esemeny
             case ANOMALY -> score >= 0.34;
+            // ONCOMING_TRUCK: szembejovo nagy jarmu (kamion / busz) - kozeli silhouette
+            // a vanishing point korul, modell silhouette-grow + horizon-vehicle profil
+            case ONCOMING_TRUCK -> score >= 0.28;
             default -> score >= 0.18;
         };
     }
@@ -34,6 +37,7 @@ public class EventScoringService {
             case CROSSING_VEHICLE -> "Keresztbe meno jarmu keresese";
             case ANOMALY -> "Anomalia/szabalytalansag keresese";
             case ROAD_OBSTACLE -> "Utakadaly keresese";
+            case ONCOMING_TRUCK -> "Szembejovo kamion / busz keresese";
             case MOTION -> "Demo: mozgasalapu jelenet-kereses";
         };
     }
@@ -47,6 +51,7 @@ public class EventScoringService {
             case CROSSING_VEHICLE -> "Keresztbe meno jarmu: crossMotionRatio * travelScore * residualGate * crossTravelGate, plusz centroid-elmozdulas legalabb ~0.10 kepszelesseg ~1.2 s alatt — szarvas-szuro nelkul, igy autoszinek is mehetnek.";
             case ANOMALY -> "Anomalia: burstScore (residualIntensity-EMA elteres) gate-elve max(crossMotionRatio, lateralSweepScore)-szal — minimalis residualIntensity korlattal a zaj ellen.";
             case ROAD_OBSTACLE -> "Utakadaly / megallas: hosszu intensity-EMA es shiftMag-EMA letorese (drop ratio) + alacsony abszolut intensity. Score = stopDrop * stopGate.";
+            case ONCOMING_TRUCK -> "Szembejovo kamion / busz: a residualMaszk centroid a kep felso felehez kozel (kozeli vanishing point), magas lateralTrack DE alacsony tenyleges crossTravel (silhouette in-place novekedése), neutral vagy szines jarmu-jel.";
             case MOTION -> "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
         };
     }
@@ -60,6 +65,7 @@ public class EventScoringService {
             case CROSSING_VEHICLE -> EventType.CROSSING_VEHICLE;
             case ANOMALY -> EventType.ANOMALY;
             case ROAD_OBSTACLE -> EventType.ROAD_OBSTACLE;
+            case ONCOMING_TRUCK -> EventType.CROSSING_VEHICLE;
             case MOTION -> EventType.GENERIC_MOTION;
         };
     }

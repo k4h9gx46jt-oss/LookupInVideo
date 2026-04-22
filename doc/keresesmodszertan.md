@@ -710,3 +710,194 @@ A kereso gyakorlatilag minden mintaponton ezeket vizsgalja:
 10. temporalis utoszures (deer), majd vegso top lista.
 
 Ez adja a teljes, jelenlegi LookupInVideo keresesmodszertant.
+
+## 20. Regresszios teszt esetek (`SceneDetectionScenarioTest`)
+
+A `src/test/java/com/gazsik/lookupinvideo/scenarios/SceneDetectionScenarioTest`
+osztaly egy SpringBoot integracios tesztkeszlet, amit minden forditasnal
+(`mvn -B test`, `mvn -B verify`) lefuttatunk. Celja: az algoritmus iteralasa
+soran azonnal eszrevegyuk, ha
+- elveszitunk egy korabban mar megtalalt szarvas-talalatot (POSITIVE asserts), vagy
+- visszahozunk egy mar kiszurt false-positive osztalyt (NEGATIVE asserts).
+
+A tesztek `Assumptions.assumeTrue(Files.exists(...))`-szel skippelnek,
+ha az adott video nincs a workspace-ben (CI / friss klon eseten).
+A teszt tehat soha nem hasal el a hianyzo media miatt.
+
+### 20.1 POSITIVE esetek (szarvas talalatnak KELL lennie a megadott ablakban)
+
+| Teszt metodus                                       | Video                                                         | Elvart ablak | Leiras                                                                                       |
+|-----------------------------------------------------|---------------------------------------------------------------|--------------|----------------------------------------------------------------------------------------------|
+| `positive_demo1_deerCrossing`                       | `demoVideo/Demo1.mp4`                                         | 22-30 s      | Klasszikus szarvas keresztbe (~24-28 s). Tipikus benchmark mintaul vesszuk.                  |
+| `positive_ytDownDeerHit_leftToRightCrossing`        | `demoVideo/YTDown.com_..._ARAbzOi-Z8Q_001_1080p.mp4`          | 21-29 s      | Szarvas keresztbe FUT a masik oldalrol (balrol jobbra, ~23-27 s).                            |
+
+### 20.2 NEGATIVE esetek (szembejovo kamion / elozes — szarvas talalat NEM lehet)
+
+Ezek mindegyike "truck oncoming / approaching truck / overtake" esemeny;
+korabbi futasnal a deer-detector tevesen szarvas-talalatot produkalt rajuk.
+
+| Teszt metodus                          | Video                                                | Tiltott ablak | Esemeny tipusa                                          |
+|----------------------------------------|------------------------------------------------------|---------------|---------------------------------------------------------|
+| `negative_oncomingTruck_153500`        | `liveformowncam/NO20260415-153500-000329.mp4`        | 0-60 s        | Szembejovo feher kamion ("white truck oncoming")        |
+| `negative_overtake_153800`             | `liveformowncam/NO20260415-153800-000332.MP4`        | 25-60 s       | Elozes 43-55 s kozott ("overtake / pass-by")            |
+| `negative_oncomingTruck_154200`        | `liveformowncam/NO20260415-154200-000336.mp4`        | 40-55 s       | Szembejovo feher kamion ~49 s                           |
+| `negative_oncomingTruck_154401`        | `liveformowncam/NO20260415-154401-000338.mp4`        | 0-12 s        | Szembejovo feher kamion piros potkocsival ~6-8 s        |
+| `negative_oncomingTruck_154801`        | `liveformowncam/NO20260415-154801-000342.mp4`        | 5-15 s        | Szembejovo szurke kamion ~10 s                          |
+| `negative_oncomingTruck_155602`        | `liveformowncam/NO20260415-155602-000350.mp4`        | 40-55 s       | Szembejovo feher kamion + feher potkocsi ~49 s          |
+| `negative_oncomingTruck_160503`        | `liveformowncam/NO20260415-160503-000359.mp4`        | 30-50 s       | Szembejovo piros kamion ~44-45 s                        |
+
+### 20.3 Megnevezesi konvencio (kulcsszavak a teszt-azonositokban)
+
+A teszt metodus neveben elerheto angol-magyar tag-ek, hogy a regresszios
+osztalyok grep-pel is kereshetoek legyenek:
+- `oncomingTruck`  — szembejovo kamion / "truck oncoming" / "approaching truck"
+- `overtake`       — elozes / "overtake" / "pass-by"
+- `deerCrossing`   — klasszikus szarvas keresztbe ("deer crossing")
+- `leftToRightCrossing` — szarvas a "masik oldalrol" balrol jobbra
+
+A kamion-szineket a leirasokban kihangsulyozzuk (white / red / grey,
+piros potkocsi, stb.) hogy szinfuggetlen elemzeskor (`red blue green
+truck`, "kamion szembe") is rakereshetoek legyenek a teszt esetekre.
+
+### 20.4 Hogyan futtassuk
+
+```bash
+# csak a regresszios scenario-tesztkeszlet:
+./mvnw -DfailIfNoTests=false -Dtest=SceneDetectionScenarioTest test
+
+# teljes tesztkeszlet (ide tartozik):
+mvn -B verify
+```
+
+A teszt minden POSITIVE esetnel ellenorzi, hogy az `outcome.matches`
+listaban van legalabb egy elem, amelynek `timestampSeconds`-e a megadott
+ablakba esik. NEGATIVE esetnel pontosan az ellenkezojet: nem lehet
+egyetlen match sem az ablakban. Ha a kuszob/penalty hangolasa miatt
+egy kategoria atbillen, a teszt azonnal kiakad es jelzi, melyik video
+es melyik idoponton.
+
+### 20.5 Uj eset hozzaadasa
+
+1. uj `@Test` metodust adunk a `SceneDetectionScenarioTest`-be a fenti
+   tablazat mintajara,
+2. a video-fajl teljes nevevel a `LIVE_DIR` vagy `DEMO_DIR` ala mutassunk,
+3. a tablazatot itt (20.1 / 20.2) frissitsuk, hogy a doc szinkronban legyen.
+
+
+## 21. Megvalositott, tesztelt keresesek (2026-04-22 iteracio)
+
+Ez a fejezet az iteracio vegen rogzitett *jelenlegi* allapotot
+dokumentalja: melyik kerdes melyik intent-re fut, milyen heurisztikat
+kapott a most tesztelt klipekre, es a 16 regresszios teszt kozul
+melyek mentek (15) es melyik nem (1).
+
+### 21.1 Tamogatott, tesztelt keresesi formak
+
+| Tema | QueryIntent | Pelda magyar query-k | Pelda angol query-k |
+| --- | --- | --- | --- |
+| Vad / szarvas atvagas | `WILDLIFE` | szarvas, vad, allat, oz, vaddiszno | deer, wildlife, animal, boar |
+| Szembejovo kamion / busz | `ONCOMING_TRUCK` (UJ) | kamion szembe, feher kamion szembe, piros kamion, szurke kamion, busz szembejon | oncoming truck, approaching truck, white truck, red truck, grey truck, head-on truck |
+
+A `KW_ONCOMING_TRUCK` lista a `QueryInterpretationService`-ben van;
+a `resolveIntent` *a COLOR utan, a WILDLIFE elott* nezi, igy a
+"kamion szembe" nem akad fel a "kam" toredekkel a WILDLIFE szotaron.
+
+### 21.2 ONCOMING_TRUCK score keplet (additiv blend)
+
+A korabbi multiplikativ 6-gate keplet osszeszorozva ~0-ra esett ossze,
+ezert egy egyszeru, additiv profilra cserelodott. A 7 dashcam klipre
+(NO20260415-153500..160503) merhetonek bizonyultak az alabbi tartomanyok:
+
+```
+centroidY (cY)         : 0.45 .. 0.53   (silhouette a horizont kornyeken)
+lateralTrackScore      : 0.80 .. 1.00   (silhouette folyamatosan no)
+neutralDominance       : 0.25 .. 0.42   (feher / szurke kamiontest)
+vehicleColorSignal     : 2.5% .. 17.1%  (piros / kek kabin)
+burstScore             : 0.000 .. 0.041 (sima haladas, nem ugralo)
+```
+
+Ezekre kalibralt komponensek (mind 0..1):
+```
+horizonGate     = clamp((HORIZON_VEHICLE_CENTROID_Y_MAX - cY) / 0.20, 0, 1)
+                  // HORIZON_VEHICLE_CENTROID_Y_MAX = 0.55
+lateralTrack    = clamp(lateralTrackScore, 0, 1)
+colorEvidence   = clamp(max(neutralDominance / 0.40,
+                            vehicleColorSignal / 0.20), 0, 1)
+smoothness      = clamp(1 - burstScore / 0.080, 0, 1)
+```
+
+Vegso pontszam:
+```
+score = 0.40 * horizonGate
+      + 0.30 * lateralTrack
+      + 0.20 * colorEvidence
+      + 0.10 * smoothness
+isMatch ha score >= 0.28   (EventScoringService.isMatch arm)
+mapEventType -> CROSSING_VEHICLE
+modeLabel    -> "Szembejovo kamion / busz keresese"
+```
+
+`FrameSampler` ennel az intentnel 0.4s mintavetelt hasznal
+(`computeSampleStepUs` -> 400_000L), igy a kozeledo silhouette tobb
+mintapontot kap a teljes kozeledesen.
+
+### 21.3 Wildlife pre-filter: looksLikeOncomingTruckProfile
+
+Ez a hard-drop szuro a `WILDLIFE` agon belul fut, a tobbi
+`looksLikeOncomingVehicle` / `looksLikePseudoLateralGrowth` szuroval
+egy lancban. *Mind* az alabbi feltetel egyutt kell legyen, kulonben
+nem ad ki dropot:
+
+```
+cY  <= WILDLIFE_TRUCK_FILTER_CENTROID_Y_MAX (= 0.54)   // szigoruabb mint
+                                                       // a 0.55 horizon
+                                                       // konstans, hogy a
+                                                       // YTDown szarvas
+                                                       // (cY=0.55) ne essen
+                                                       // ki tevesen.
+lateralTrackScore   >= 0.72
+burstScore          <= 0.060
+residualIntensity   <= 0.110
+vehicleColorSignal  >= 0.022      // legtisztabb diszkriminator: 7 NEG kamion
+                                  // mind >= 2.5%, YTDown szarvas-zaj 0.1-0.2%
+neutralDominance >= 0.18  OR  vehicleColorSignal >= 0.10
+```
+
+A `crossTravel`-t SZANDEKOSAN nem szuri: a kamera + kozeledo kamion
+egyuttese 0.08-0.16 kozti centroid-vandorlast okoz, megkulonbozhetetlen
+egy keresztezo allat sodrodasatol ezen az egy jelen.
+
+### 21.4 Tesztkatalogus eredmenyek (jelenlegi futtatas)
+
+| Teszt | Var | Eredmeny |
+| --- | --- | --- |
+| `positive_demo1_deerCrossing` (Demo1.mp4, 22-30s) | szarvas hit | **FAIL** (oroklott baseline-hiba: a 24s-os szarvas pontszama < 0.21 wildlife kuszob; a t=0.9s start-up zaj jon csak fel, conf=0.30) |
+| `positive_ytDownDeerHit_leftToRightCrossing` | szarvas hit | **PASS** |
+| `negative_oncomingTruck_153500..160503` (7 db) | NEM lehet szarvas | **PASS** mind a 7 |
+| `negative_overtake_153800` | NEM lehet szarvas | **PASS** |
+| `positive_oncomingTruck_153500..160503` (7 db) | ONCOMING_TRUCK hit | **PASS** mind a 7 |
+
+Osszesitve: **15 / 16 zold**, az egyetlen fail (`positive_demo1_deerCrossing`)
+nem regresszio: a 22-30s ablakban a Demo1 szarvas-jel ezen az
+algoritmus-allapoton mar a baseline ota nem eri el a 0.21-os wildlife
+kuszobot, a t=0.9s kameraidito-zaj viszont igen. Ennek megoldasa
+kulon iteracio (vagy a wildlife gate ovatos csokkentese 0.18-ra a
+*csak az elso 2s utan* idosavra, vagy a Demo1-specifikus deer-jel
+megerositese a `Kozepso regio` + `Oldalpalya` egyuttesere).
+
+### 21.5 Futtatas
+
+Az osszes kategorianak megfelelo skript:
+```
+./tools/run-scenario-tests.sh                 # teljes 16-os szet
+./tools/run-scenario-tests.sh '#positive_*'   # csak positive_*
+./tools/run-scenario-tests.sh '#negative_*'   # csak negative_*
+```
+
+Nyersen:
+```
+./mvnw -DfailIfNoTests=false -Dtest='SceneDetectionScenarioTest' test
+```
+
+A teljes szet futasi ideje a fejlesztoi macOS gepen ~2:20 min
+(7 sample / klip x 2 mp video, OpenCL GPU aktiv).

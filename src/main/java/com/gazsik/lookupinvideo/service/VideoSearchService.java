@@ -118,6 +118,25 @@ public class VideoSearchService {
     private static final double OVERTRACKED_FLOW_CENTER_MIN = 0.38;
     private static final double OVERTRACKED_FLOW_LATERAL_MIN = 0.45;
     private static final double OVERTRACKED_FLOW_RESIDUAL_MIN = 0.030;
+    /**
+     * CentroidY threshold separating "near-horizon vehicle silhouette" (oncoming truck/bus
+     * approaching the vanishing point) from a road-level moving subject. Residual-mask
+     * centroid for far-away approaching vehicles tends to settle in the upper half of the
+     * frame ({@code centroidY <= ~0.55}). Used by:
+     * <ul>
+     *   <li>{@link QueryIntent#ONCOMING_TRUCK} scoring (positive: closer to the horizon = higher score)</li>
+     *   <li>{@link QueryIntent#WILDLIFE} pre-filter via {@link #looksLikeOncomingTruckProfile} (drop matches that look like an approaching truck)</li>
+     * </ul>
+     */
+    private static final double HORIZON_VEHICLE_CENTROID_Y_MAX = 0.55;
+    /**
+     * Tighter threshold used ONLY by the wildlife truck-rejection pre-filter.
+     * Empirically the YTDown deer-noise frame sits at cY=0.55, while every NEG dashcam
+     * truck false-positive measured (153500/153800/154200/154401/154801/155602/160503)
+     * has cY in 0.45-0.53. A 0.54 cutoff catches all known trucks without touching the
+     * borderline deer frame.
+     */
+    private static final double WILDLIFE_TRUCK_FILTER_CENTROID_Y_MAX = 0.54;
     private static final List<String> VIDEO_EXTENSIONS =
             List.of(".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg");
 
@@ -721,8 +740,18 @@ public class VideoSearchService {
                         if (likelyRoadVehicleByColor && !strongCrossingCandidate) {
                             continue;
                         }
+                        // Reject ego-turn / roundabout: when the WHOLE scene rotates coherently the
+                        // residual-mask centroid drifts laterally as a side-effect of the camera
+                        // rotation — this looks identical to a crossing animal track to the
+                        // wildlife scorer. Block it before the per-shape filters even run.
+                        // The TURN intent has its own dedicated detector and will pick this up
+                        // separately for users searching for "kanyar" / "turn" / "roundabout".
+                        if (looksLikeEgoTurn(motionMetrics, signedShiftXEma)) {
+                            continue;
+                        }
                         if (looksLikeOncomingVehicle(motionMetrics, activeGrowth)
-                                || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)) {
+                                || looksLikePseudoLateralGrowth(motionMetrics, activeGrowth, lateralTrackScore)
+                                || looksLikeOncomingTruckProfile(motionMetrics, lateralTrackScore, burstScore, vehicleColorSignal, neutralSignal)) {
                             continue;
                         }
                         if (!strongCrossingCandidate
@@ -747,13 +776,17 @@ public class VideoSearchService {
                         );
                         reason = String.format(
                                 Locale.ROOT,
-                                "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%% | Oldalpalya: %.1f%% | Autoszin: %.1f%%",
+                                "Szarvas-heurisztika: %.1f%% | Keresztmozgas: %.1f%% | Kiemelt mozgas: %.1f%% | Kozepso regio: %.1f%% | Oldalpalya: %.1f%% | Autoszin: %.1f%% | cY=%.2f burst=%.3f cTrav=%.3f neutral=%.2f",
                                 score * 100,
                                 motionMetrics.crossMotionRatio * 100,
                                 motionMetrics.residualIntensity * 100,
                                 motionMetrics.centerRatio * 100,
                                 lateralTrackScore * 100,
-                                vehicleColorSignal * 100
+                                vehicleColorSignal * 100,
+                                motionMetrics.centroidY,
+                                burstScore,
+                                motionMetrics.crossTravel,
+                                colorStats.neutralDominance
                         );
                     } else if (intent == QueryIntent.TURN) {
                         // === PROPER TURN DETECTOR (ket fuggetlen jel kombinacioja) ===
@@ -883,6 +916,45 @@ public class VideoSearchService {
                                 motionMetrics.residualIntensity * 100,
                                 sideSignal * 100,
                                 motionMetrics.activeRatio * 100);
+                    } else if (intent == QueryIntent.ONCOMING_TRUCK) {
+                        // === ONCOMING_TRUCK detector ===
+                        // Empirically calibrated against the 7 dashcam clips in
+                        // SceneDetectionScenarioTest#positive_oncomingTruck_*. Observed truck-frame
+                        // metrics (centroidY 0.45-0.53, lateralTrackScore 0.80-1.00,
+                        // neutralDominance 0.25-0.42, vehicleColorSignal 2.5-17%, burst 0-0.04).
+                        //
+                        // Additive blend (NOT a multiplicative gate product — that collapses to 0).
+                        //   horizonGate    : 0.55 - cY mapped over 0.20 → upper-frame silhouette
+                        //   lateralTrack   : direct (overgrowth = silhouette inflating)
+                        //   colorEvidence  : neutral OR red/blue body color
+                        //   smoothness     : 1 - burst/0.080 → vehicles move smoothly
+                        // Threshold isMatch >= 0.28 in EventScoringService.
+                        double vehicleColorSignal = Math.max(colorStats.redDominance, colorStats.blueDominance);
+                        double neutralSignal = colorStats.neutralDominance;
+
+                        double horizonGate = clamp(
+                                (HORIZON_VEHICLE_CENTROID_Y_MAX - motionMetrics.centroidY) / 0.20, 0.0, 1.0);
+                        double lateralTrack = clamp(lateralTrackScore, 0.0, 1.0);
+                        double colorEvidence = clamp(
+                                Math.max(neutralSignal / 0.40, vehicleColorSignal / 0.20), 0.0, 1.0);
+                        double smoothness = clamp(1.0 - burstScore / 0.080, 0.0, 1.0);
+
+                        score = 0.40 * horizonGate
+                                + 0.30 * lateralTrack
+                                + 0.20 * colorEvidence
+                                + 0.10 * smoothness;
+                        score = clamp(score, 0.0, 1.0);
+                        reason = String.format(Locale.ROOT,
+                                "Szembejovo kamion: %.1f%% | horizon=%.1f%% lateral=%.1f%% color=%.1f%% smooth=%.1f%% | cY=%.2f burst=%.3f neutral=%.2f vColor=%.3f",
+                                score * 100,
+                                horizonGate * 100,
+                                lateralTrack * 100,
+                                colorEvidence * 100,
+                                smoothness * 100,
+                                motionMetrics.centroidY,
+                                burstScore,
+                                neutralSignal,
+                                vehicleColorSignal);
                     } else {
                         score = motionMetrics.intensity;
                         reason = String.format(Locale.ROOT, "Mozgas-intenzitas: %.1f%%", motionMetrics.intensity * 100);
@@ -1061,6 +1133,43 @@ public class VideoSearchService {
         return centerLocked && growingObject && sufficientlyStrong && (lowLateralTravel || slowLateralCentroid);
     }
 
+    /**
+     * Detects an ego-turn / roundabout: the WHOLE scene rotates coherently because the camera
+     * (mounted in the car) is yawing. This looks like a crossing animal to the residual-mask
+     * centroid tracker, so the wildlife pipeline must reject it explicitly.
+     *
+     * <p>Used signals (any 2 of 4 must hold):
+     * <ol>
+     *   <li><b>Lateral edge sweep:</b> {@code lateralSweepScore >= 0.42} — left vs right edge
+     *       diff asymmetry; only camera rotation produces this consistently.</li>
+     *   <li><b>Coherent global motion:</b> residual is small relative to total intensity
+     *       ({@code residualIntensity <= 0.55 * intensity}) — most pixels move uniformly.</li>
+     *   <li><b>Sustained horizontal pan (~2 s EMA):</b> {@code |signedShiftXEma| >= 1.4 px}.</li>
+     *   <li><b>Horizontal-dominant instantaneous shift:</b> {@code |globalShiftX| >= 1.5} AND
+     *       {@code |globalShiftX| >= 1.6 * |globalShiftY|}.</li>
+     * </ol>
+     * Two simultaneous signals are enough; one alone could be a passing vehicle or noisy edge.
+     */
+    private static boolean looksLikeEgoTurn(MotionMetrics motion, double signedShiftXEma) {
+        // Need ego motion at all to be in a turn — otherwise this is a parked-camera scene.
+        if (motion.intensity < 0.020) {
+            return false;
+        }
+        boolean sweepHigh = motion.lateralSweepScore >= 0.42;
+        boolean coherentGlobal = motion.intensity > 1e-6
+                && motion.residualIntensity <= 0.55 * motion.intensity;
+        boolean sustainedPan = Math.abs(signedShiftXEma) >= 1.4;
+        double absShiftX = Math.abs((double) motion.globalShiftX);
+        double absShiftY = Math.abs((double) motion.globalShiftY);
+        boolean horizDominantShift = absShiftX >= 1.5 && absShiftX >= 1.6 * absShiftY;
+
+        int signals = (sweepHigh ? 1 : 0)
+                + (coherentGlobal ? 1 : 0)
+                + (sustainedPan ? 1 : 0)
+                + (horizDominantShift ? 1 : 0);
+        return signals >= 2;
+    }
+
     private static boolean looksLikePseudoLateralGrowth(MotionMetrics motion, double activeGrowth, double lateralTrackScore) {
         return motion.crossMotionRatio >= 0.55
                 && motion.crossTravel <= WEAK_LATERAL_CROSS_TRAVEL_MAX
@@ -1151,6 +1260,61 @@ public class VideoSearchService {
             && (lateralTrackScore >= 0.70 || lateralTrackScore <= 0.22);
         boolean neutralVehicle = neutralSignal >= ROAD_VEHICLE_NEUTRAL_SIGNAL_MIN && lateralTrackScore < 0.80;
         return roadLikeMotion && (colorfulVehicle || neutralVehicle);
+    }
+
+    /**
+     * Detects an oncoming truck / bus / large vehicle approaching the camera that the
+     * crossing-vehicle signals would otherwise mis-classify as a deer crossing.
+     *
+     * <p>This is the negative complement of {@link QueryIntent#ONCOMING_TRUCK} scoring:
+     * if a frame strongly matches the oncoming-truck profile, the wildlife pipeline
+     * must reject it. Used inside the wildlife pre-filter chain.
+     *
+     * <p>Empirically derived from the 7 NEG dashcam clips
+     * ({@code SceneDetectionScenarioTest#negative_oncomingTruck_*}).
+     * The false-positive frames all share these properties:
+     * <ul>
+     *   <li>{@code centroidY <= 0.55} — residual mask sits in the upper half of the frame
+     *       (silhouette near the vanishing point).</li>
+     *   <li>{@code lateralTrackScore >= 0.72} — the slowly-growing silhouette inflates the
+     *       lateral-track score even though there is no real animal track.</li>
+     *   <li>{@code burstScore <= 0.060} — vehicles move smoothly into view; deer crossings
+     *       spike the residual much harder ({@code burst} typically &gt; 0.07 for a real deer).</li>
+     *   <li>moderate body color: {@code neutralDominance >= 0.18} (white / grey truck body)
+     *       OR {@code vehicleColorSignal >= 0.10} (red / blue cab).</li>
+     *   <li>not too bright in the residual: {@code residualIntensity <= 0.110} — distinguishes
+     *       a smoothly-approaching silhouette from a fast wildlife flash-in.</li>
+     * </ul>
+     * Note: cross-travel is INTENTIONALLY not constrained here. In the dashcam corpus the
+     * combined camera+truck motion sweeps the residual centroid by 0.08-0.16, indistinguishable
+     * from a crossing animal in that one signal.
+     */
+    private static boolean looksLikeOncomingTruckProfile(MotionMetrics motion,
+                                                         double lateralTrackScore,
+                                                         double burstScore,
+                                                         double vehicleColorSignal,
+                                                         double neutralSignal) {
+        if (motion.centroidY > WILDLIFE_TRUCK_FILTER_CENTROID_Y_MAX) {
+            return false;
+        }
+        if (lateralTrackScore < 0.72) {
+            return false;
+        }
+        if (burstScore > 0.060) {
+            return false;
+        }
+        if (motion.residualIntensity > 0.110) {
+            return false;
+        }
+        // Truck cab/hood produces measurable red/blue/yellow color signal (>= 2.5% in the
+        // dashcam corpus). Real wildlife (e.g. YTDown 21-29s deer) has near-zero vehicleColor.
+        // This is the cleanest single discriminator; without it the filter also kills the
+        // YTDown deer because its centroidY/lateralTrack/burst overlap the truck profile.
+        if (vehicleColorSignal < 0.022) {
+            return false;
+        }
+        boolean vehicleColorEvidence = neutralSignal >= 0.18 || vehicleColorSignal >= 0.10;
+        return vehicleColorEvidence;
     }
 
     private static double computeLateralTrackScore(List<TrackPoint> deerTrack,

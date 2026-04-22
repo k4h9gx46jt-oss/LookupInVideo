@@ -93,6 +93,25 @@ public class QueryInterpretationService {
         "debris", "fallen object", "road hazard"           // szinonimák
     };
 
+    // ONCOMING_TRUCK — szembejövő kamion / busz / nagy jármű (új intent)
+    // Azon mintákra, amiket korábban WILDLIFE-ként téves szarvas-találatnak vett a
+    // detektor: szembejövő fehér / piros / szürke kamion vagy busz, ami a vanishing
+    // point közelében közeledik a kamerához.
+    private static final String[] KW_ONCOMING_TRUCK = {
+        "kamion szembe", "kamion szembejon", "szembejovo kamion",  // magyar alap
+        "szembe kamion", "szembe jovo kamion",
+        "kamion kozelit", "kozelito kamion",
+        "feher kamion", "piros kamion", "szurke kamion",           // szín-variánsok (magyar)
+        "feher kamion szembe", "piros kamion szembe", "szurke kamion szembe",
+        "busz szembe", "szembejovo busz",
+        "oncoming truck", "approaching truck", "truck oncoming",   // angol alap
+        "truck approaching", "incoming truck",
+        "white truck oncoming", "red truck oncoming", "grey truck oncoming",
+        "white truck", "red truck", "grey truck", "gray truck",
+        "oncoming bus", "approaching bus",
+        "oncoming traffic truck", "head-on truck", "head on truck"
+    };
+
     // -------------------------------------------------------------------------
 
     public SearchQueryInterpretation interpret(String rawQuery) {
@@ -116,6 +135,9 @@ public class QueryInterpretationService {
     public QueryIntent resolveIntent(String normalizedQuery) {
         if (containsAny(normalizedQuery, KW_COLOR)) {
             return QueryIntent.COLOR;
+        }
+        if (containsAny(normalizedQuery, KW_ONCOMING_TRUCK)) {
+            return QueryIntent.ONCOMING_TRUCK;
         }
         if (containsAny(normalizedQuery, KW_WILDLIFE)) {
             return QueryIntent.WILDLIFE;
