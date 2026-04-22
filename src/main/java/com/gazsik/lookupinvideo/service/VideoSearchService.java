@@ -16,6 +16,7 @@ import org.bytedeco.javacv.Java2DFrameConverter;
 import org.bytedeco.javacv.OpenCVFrameConverter;
 import org.bytedeco.opencv.opencv_core.Mat;
 import org.bytedeco.opencv.opencv_core.Moments;
+import org.bytedeco.opencv.opencv_core.Point2d;
 import org.bytedeco.opencv.opencv_core.Rect;
 import org.bytedeco.opencv.opencv_core.Scalar;
 import org.bytedeco.opencv.opencv_core.Size;
@@ -66,6 +67,7 @@ import static org.bytedeco.opencv.global.opencv_core.haveOpenCL;
 import static org.bytedeco.opencv.global.opencv_core.mean;
 import static org.bytedeco.opencv.global.opencv_core.setUseOpenCL;
 import static org.bytedeco.opencv.global.opencv_core.useOpenCL;
+import static org.bytedeco.opencv.global.opencv_core.CV_32F;
 import static org.bytedeco.opencv.global.opencv_imgproc.COLOR_BGR2GRAY;
 import static org.bytedeco.opencv.global.opencv_imgproc.COLOR_BGRA2BGR;
 import static org.bytedeco.opencv.global.opencv_imgproc.COLOR_GRAY2BGR;
@@ -73,6 +75,7 @@ import static org.bytedeco.opencv.global.opencv_imgproc.INTER_AREA;
 import static org.bytedeco.opencv.global.opencv_imgproc.THRESH_BINARY;
 import static org.bytedeco.opencv.global.opencv_imgproc.cvtColor;
 import static org.bytedeco.opencv.global.opencv_imgproc.moments;
+import static org.bytedeco.opencv.global.opencv_imgproc.phaseCorrelate;
 import static org.bytedeco.opencv.global.opencv_imgproc.resize;
 import static org.bytedeco.opencv.global.opencv_imgproc.threshold;
 
@@ -1366,7 +1369,12 @@ public class VideoSearchService {
         Mat previousShared = new Mat(previous, sharedRect);
         Mat currentShared = new Mat(current, sharedRect);
         try {
-            GlobalShift shift = estimateGlobalShiftOpenCl(previousShared, currentShared, width, height);
+            // GPU path: phaseCorrelate runs 2 forward DFTs + 1 inverse DFT on UMat — sustained,
+            // genuinely heavy GPU work that replaces the 17x13 = 221-iteration CPU brute-force loop.
+            // Falls back transparently to the CPU brute-force if any OpenCL/UMat call throws.
+            GlobalShift shift = preferGpu
+                    ? estimateGlobalShiftPhaseCorrelate(previousShared, currentShared, width, height)
+                    : estimateGlobalShiftOpenCl(previousShared, currentShared, width, height);
             double intensity = rgbDiffMean01(previousShared, currentShared, preferGpu);
 
             // Lateral sweep: left edge vs right edge asymmetry — direct camera-pan signal,
@@ -1575,6 +1583,62 @@ public class VideoSearchService {
         } finally {
             currentShared.release();
             previousShared.release();
+        }
+    }
+
+    /**
+     * Phase-correlation based global shift estimator running on UMat.
+     *
+     * <p>Pipeline (all stages on UMat → dispatched to GPU through OpenCL/Metal bridge on macOS):
+     * <ol>
+     *   <li>BGR→Gray conversion (cvtColor on UMat)</li>
+     *   <li>uint8 → float32 conversion (convertTo on UMat)</li>
+     *   <li>Forward DFT on each frame (inside phaseCorrelate)</li>
+     *   <li>Cross-power spectrum + inverse DFT (inside phaseCorrelate)</li>
+     *   <li>Sub-pixel peak refinement (inside phaseCorrelate)</li>
+     * </ol>
+     * The returned (dx, dy) is rounded to int and clamped to the same search window the legacy
+     * brute-force estimator uses, so downstream code paths see identical semantics.
+     *
+     * <p>If anything in the OpenCL stack throws (driver bug, unsupported size, etc.), the caller
+     * falls back to the CPU brute-force estimator via the surrounding try/catch in
+     * {@link #computeMotionMetricsWithBackend}.
+     */
+    private static GlobalShift estimateGlobalShiftPhaseCorrelate(Mat previous,
+                                                                 Mat current,
+                                                                 int width,
+                                                                 int height) {
+        UMat uPrev = new UMat();
+        UMat uCurr = new UMat();
+        UMat uPrevGray = new UMat();
+        UMat uCurrGray = new UMat();
+        UMat uPrevF = new UMat();
+        UMat uCurrF = new UMat();
+        try {
+            previous.copyTo(uPrev);
+            current.copyTo(uCurr);
+            cvtColor(uPrev, uPrevGray, COLOR_BGR2GRAY);
+            cvtColor(uCurr, uCurrGray, COLOR_BGR2GRAY);
+            uPrevGray.convertTo(uPrevF, CV_32F);
+            uCurrGray.convertTo(uCurrF, CV_32F);
+
+            // phaseCorrelate(src1, src2) returns the (x, y) translation that takes src1 -> src2.
+            // Same sign convention as the brute-force estimator: positive dx means curr is
+            // shifted to the right relative to prev (camera panned left, content moved right).
+            Point2d shift = phaseCorrelate(uPrevF, uCurrF);
+            int dx = (int) Math.round(shift.x());
+            int dy = (int) Math.round(shift.y());
+            dx = Math.max(-GLOBAL_SHIFT_MAX_DX, Math.min(GLOBAL_SHIFT_MAX_DX, dx));
+            dy = Math.max(-GLOBAL_SHIFT_MAX_DY, Math.min(GLOBAL_SHIFT_MAX_DY, dy));
+            shift.deallocate();
+            return new GlobalShift(dx, dy);
+        } finally {
+            uPrevF.release();
+            uCurrF.release();
+            uPrevGray.release();
+            uCurrGray.release();
+            uPrev.release();
+            uCurr.release();
         }
     }
 
