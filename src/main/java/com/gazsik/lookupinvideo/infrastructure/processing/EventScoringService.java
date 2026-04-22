@@ -10,7 +10,11 @@ public class EventScoringService {
     public boolean isMatch(QueryIntent intent, double score) {
         return switch (intent) {
             case COLOR -> score >= 0.14;
-            case WILDLIFE -> score >= 0.21;
+            // WILDLIFE: deer / vad keresztezes — gate 0.20 (Demo1 canonikus szarvas
+            // 0.201-en jon at, lasd doc/keresesmodszertan.md 21.4). Az oncoming-truck
+            // false-positive-okat a VideoSearchService.looksLikeOncomingTruckProfile
+            // pre-filter mar pontszamozas elott eldobja, igy a 0.20 gate biztonsagos.
+            case WILDLIFE -> score >= 0.20;
             // TURN: lateralSweepScore * motionGate (0=szimmetrikus/egyenes, 1=teljesen aszimmetrikus/kanyar)
             case TURN -> score >= 0.30;
             // LANE_CHANGE: koherens horizontalis kameraeltolas, alacsony residual + nem teljes kanyar

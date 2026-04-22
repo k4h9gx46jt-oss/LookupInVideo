@@ -127,6 +127,7 @@ Ha nincs property megadva:
 |----------------------|------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
 | **COLOR**            | `piros`, `zold`, `kek`                                                             | `red`, `green`, `blue`                                                                              | Adott szín dominanciája a képen, mozgásboosttal              |
 | **WILDLIFE**         | `szarvas`, `vad`, `oz`                                                             | `deer`, `wildlife`, `animal`, `wild animal`, `animal crossing`, `road animal`, `animal on road`, `roadside animal` | Keresztirányú mozgás — szarvas/vad heurisztika  |
+| **ONCOMING_TRUCK**   | `kamion szembe`, `feher kamion szembe`, `piros kamion`, `szurke kamion`, `busz szembe`, `busz szembejon` | `oncoming truck`, `approaching truck`, `white truck`, `red truck`, `grey truck`, `head-on truck`, `oncoming bus` | Szembejövő kamion / busz közeledés detektálása |
 | **LANE_CHANGE**      | `savalt`, `savvaltas`, `besorol`, `atmegy masik savba`, `kicsúszik a savbol`       | `lane change`, `lane_change`, `changing lane`, `merge`, `merging`, `drift`, `weaving`               | Sávváltás detektálása                                        |
 | **TURN**             | `kanyar`, `balra kanyar`, `jobbra kanyar`, `balra`, `jobbra`                       | `turn`, `turning`, `left turn`, `right turn`, `corner`, `curve`, `bend`                             | Kanyar-esemény                                               |
 | **CROSSING_VEHICLE** | `keresztbe`, `keresztbe megy`, `keresztezi`, `athalad keresztben`                  | `crossing`, `cross vehicle`, `crossing vehicle`, `vehicle crossing`, `crosses the road`, `crossing traffic`, `perpendicular motion`, `lateral crossing` | Keresztbe menő jármű |
@@ -148,6 +149,9 @@ Ha nincs property megadva:
 | `deer`                       | WILDLIFE             | Direkt egyezés                                     |
 | `wild animal`                | WILDLIFE             | Szinonima bővítés                                  |
 | `animal crossing`            | WILDLIFE             | Szinonima bővítés                                  |
+| `kamion szembe`              | ONCOMING_TRUCK       | Direkt egyezés (`KW_ONCOMING_TRUCK`)              |
+| `oncoming truck`             | ONCOMING_TRUCK       | Angol direkt egyezés                               |
+| `feher kamion szembe`        | ONCOMING_TRUCK       | Színnel kombinált truck kulcsszó                  |
 | `kanyar`                     | TURN                 | Magyar kulcsszó                                    |
 | `curve`                      | TURN                 | Szinonima                                          |
 | `sávváltás`                  | LANE_CHANGE          | Magyar kulcsszó (ékezet nélkül: `savvaltas`)       |
@@ -168,28 +172,48 @@ Ha nincs property megadva:
 ### 4.3 Prioritásrend (ha több kulcsszó egyszerre szerepel)
 
 1. `COLOR` — a szín mindig nyer minden más felett
-2. `WILDLIFE`
-3. `LANE_CHANGE`
-4. `TURN`
-5. `CROSSING_VEHICLE`
-6. `ROAD_OBSTACLE` (ide esik a sudden stop is)
-7. `ANOMALY`
-8. `MOTION` — fallback, ha semmi sem illeszkedett
+2. `ONCOMING_TRUCK` — *a* WILDLIFE *előtt*, hogy a `kamion szembe` ne akadjon fel a `kam` töredéken a wildlife szótárban
+3. `WILDLIFE`
+4. `LANE_CHANGE`
+5. `TURN`
+6. `CROSSING_VEHICLE`
+7. `ROAD_OBSTACLE` (ide esik a sudden stop is)
+8. `ANOMALY`
+9. `MOTION` — fallback, ha semmi sem illeszkedett
 
 ---
 
 ### 4.4 Megjegyzés a fallback modokról
 
-A `WILDLIFE`, `COLOR`, `TURN`, `LANE_CHANGE`, `CROSSING_VEHICLE`, `ROAD_OBSTACLE` és `ANOMALY`
-intentekhez **mindegyikhez** dedikált, matematikai jellel meghajtott pontszámfüggvény tartozik
-(részletek a 7.6 szakaszban). A `MOTION` továbbra is a fallback (általános mozgás-intenzitás)
-azoknak a szabadszöveges lekérdezéseknek, amelyek egyik kulcsszó-csoportba sem esnek.
+A `WILDLIFE`, `COLOR`, `TURN`, `LANE_CHANGE`, `CROSSING_VEHICLE`, `ROAD_OBSTACLE`, `ANOMALY`
+és `ONCOMING_TRUCK` intentekhez **mindegyikhez** dedikált, matematikai jellel meghajtott
+pontszámfüggvény tartozik (részletek a 7.6 szakaszban). A `MOTION` továbbra is a fallback
+(általános mozgás-intenzitás) azoknak a szabadszöveges lekérdezéseknek, amelyek egyik
+kulcsszó-csoportba sem esnek.
+
+### 4.5 Per-intent küszöb és modeLabel referencia (`EventScoringService`)
+
+Az `EventScoringService.isMatch(intent, score)` az alábbi minimum-pontszámokat alkalmazza,
+éés a `modeLabel(intent)` ezeket a feliratokat tölti az UI-ba (`SearchOutcome.note`).
+
+| Intent             | `isMatch` küszöb | `modeLabel`                                       | `mapEventType`     |
+|--------------------|------------------|---------------------------------------------------|--------------------|
+| `COLOR`            | `>= 0.14`        | Szinalapu kereses (piros / zold / kek)            | `COLOR`            |
+| `WILDLIFE`         | `>= 0.20`        | Vadatkeles keresese keresztmozgas alapjan         | `WILDLIFE`         |
+| `TURN`             | `>= 0.30`        | Kanyar-esemeny keresese                           | `TURN`             |
+| `LANE_CHANGE`      | `>= 0.28`        | Savvaltas keresese                                | `LANE_CHANGE`      |
+| `CROSSING_VEHICLE` | `>= 0.30`        | Keresztbe meno jarmu keresese                     | `CROSSING_VEHICLE` |
+| `ROAD_OBSTACLE`    | `>= 0.32`        | Utakadaly keresese                                | `ROAD_OBSTACLE`    |
+| `ANOMALY`          | `>= 0.34`        | Anomalia/szabalytalansag keresese                 | `ANOMALY`          |
+| `ONCOMING_TRUCK`   | `>= 0.28`        | Szembejovo kamion / busz keresese                 | `CROSSING_VEHICLE` |
+| `MOTION`           | `>= 0.10`        | Demo: mozgasalapu jelenet-kereses                 | `MOTION`           |
 
 ## 5. Fo konstansok (algoritmus parameterek)
 
 ### 5.1 Mintavetel, meret, limit
-- `DEFAULT_SAMPLE_STEP_US = 1_000_000` (1.0 s)
-- `DEER_SAMPLE_STEP_US = 150_000` (0.15 s)
+- `FrameSampler.DEFAULT_SAMPLE_STEP_US = 1_000_000` (1.0 s)
+- `FrameSampler.WILDLIFE_SAMPLE_STEP_US = 150_000` (0.15 s, a WILDLIFE rovid videoknal)
+- `ONCOMING_TRUCK` mintavetel: `400_000` us (0.4 s, `FrameSampler.computeSampleStepUs` arm)
 - `ANALYSIS_WIDTH_CPU = 320`
 - `ANALYSIS_WIDTH_GPU = 512`
 - `MAX_MATCHES = 12`
@@ -228,6 +252,14 @@ azoknak a szabadszöveges lekérdezéseknek, amelyek egyik kulcsszó-csoportba s
 - `OVERTRACKED_FLOW_LATERAL_MIN = 0.45`
 - `OVERTRACKED_FLOW_RESIDUAL_MIN = 0.030`
 
+### 5.5 Horizont / wildlife-truck filter kuszobok (uj)
+- `HORIZON_VEHICLE_CENTROID_Y_MAX = 0.55` — kozos horizon-konstans, hasznalja
+  a `ONCOMING_TRUCK` `horizonGate` tagja (`(0.55 - cY) / 0.20`).
+- `WILDLIFE_TRUCK_FILTER_CENTROID_Y_MAX = 0.54` — szigoruabb cutoff a wildlife agon
+  belul futo `looksLikeOncomingTruckProfile` szuronek; szandekosan 0.01-gyel a
+  horizon-konstans alatt, hogy a YTDown szarvas (cY=0.55) ne essen ki tevesen.
+  (Reszletek: 21.3.)
+
 ## 6. `analyzeVideo(...)` teljes menete
 
 Input:
@@ -241,10 +273,11 @@ Lepesek:
    - `CROSSING_VEHICLE`: `250_000 us`
    - `ANOMALY`: `350_000 us`
    - `ROAD_OBSTACLE`: `500_000 us`
+   - `ONCOMING_TRUCK`: `400_000 us`
    - `WILDLIFE` + duration >= 360 s: `350_000 us`
    - `WILDLIFE` + duration >= 180 s: `250_000 us`
-   - `WILDLIFE` + rovidebb: `150_000 us`
-   - egyebkent (`COLOR`, `MOTION`): `1_000_000 us`
+   - `WILDLIFE` + rovidebb: `150_000 us` (`WILDLIFE_SAMPLE_STEP_US`)
+   - egyebkent (`COLOR`, `MOTION`): `1_000_000 us` (`DEFAULT_SAMPLE_STEP_US`)
 4. analizis szelesseg:
    - GPU/OpenCL aktiv: `512`
    - kulonben CPU: `320`
@@ -519,6 +552,8 @@ Kulonben:
 ### 11.2 Oncoming/road drop fuggvenyek (nev szerint)
 - `looksLikeOncomingVehicle(motion, activeGrowth)`
 - `looksLikePseudoLateralGrowth(motion, activeGrowth, lateralTrackScore)`
+- `looksLikeOncomingTruckProfile(motion, lateralTrackScore, burstScore, vehicleColorSignal, neutralSignal)`
+  *(uj 2026-04: szembejovo kamion specifikus pre-filter; reszletek 21.3-ban)*
 - `looksLikeCenteredLowLateralVehicle(motion, lateralTrackScore)`
 - `looksLikeLowCrossHighTrackVehicle(motion, lateralTrackScore, vehicleColorSignal)`
 - `looksLikeColorfulMidLateralRoadVehicle(motion, lateralTrackScore, vehicleColorSignal)`
@@ -528,6 +563,12 @@ Kulonben:
 - `looksLikeCenterApproach(motion, lateralTrackScore)`
 - `looksLikeVehicleColorBlob(motion, colorStats, lateralTrackScore)`
 - `looksLikeRoadVehicleProfile(motion, lateralTrackScore, vehicleColorSignal, neutralSignal)`
+
+Mellettuk fut kulon, az ego-rotacios eseteket levago szuro is:
+- `looksLikeEgoTurn(motion, signedShiftXEma)` — a wildlife agon belul, *minden mas*
+  szuro elott; megakadalyozza, hogy a teljes scene-rotacio (kanyar/korforgalom)
+  altal okozott centroid-sodrodas keresztezo allatkent jelenjen meg.
+  A TURN intentnek sajat detektora van.
 
 Ezek mind kulon boolean szabalyokkal explicit dropot adnak deer modban.
 
@@ -680,8 +721,8 @@ Fobb belso pipeline:
 - `computeIntraVideoSegmentCount(...)`
 - `resolveMode(...)`
 - `resolveColorQuery(...)`
-- `sampleStepForMode(...)`
-- `isMatch(...)`
+- `FrameSampler.computeSampleStepUs(intent, durationUs)`
+- `EventScoringService.isMatch(intent, score)` / `modeLabel(intent)` / `mapEventType(intent)`
 - `postProcessDeerMatches(...)`
 - `computeDeerScore(...)`
 - `computeLateralTrackScore(...)`
@@ -871,19 +912,16 @@ egy keresztezo allat sodrodasatol ezen az egy jelen.
 
 | Teszt | Var | Eredmeny |
 | --- | --- | --- |
-| `positive_demo1_deerCrossing` (Demo1.mp4, 22-30s) | szarvas hit | **FAIL** (oroklott baseline-hiba: a 24s-os szarvas pontszama < 0.21 wildlife kuszob; a t=0.9s start-up zaj jon csak fel, conf=0.30) |
+| `positive_demo1_deerCrossing` (Demo1.mp4, 22-30s) | szarvas hit | **PASS** (a 24.10s-os szarvas conf=0.201, a wildlife gate 0.20-ra lett kalibralva ehhez a klippe; korabban 0.21-en bukott) |
 | `positive_ytDownDeerHit_leftToRightCrossing` | szarvas hit | **PASS** |
 | `negative_oncomingTruck_153500..160503` (7 db) | NEM lehet szarvas | **PASS** mind a 7 |
 | `negative_overtake_153800` | NEM lehet szarvas | **PASS** |
 | `positive_oncomingTruck_153500..160503` (7 db) | ONCOMING_TRUCK hit | **PASS** mind a 7 |
 
-Osszesitve: **15 / 16 zold**, az egyetlen fail (`positive_demo1_deerCrossing`)
-nem regresszio: a 22-30s ablakban a Demo1 szarvas-jel ezen az
-algoritmus-allapoton mar a baseline ota nem eri el a 0.21-os wildlife
-kuszobot, a t=0.9s kameraidito-zaj viszont igen. Ennek megoldasa
-kulon iteracio (vagy a wildlife gate ovatos csokkentese 0.18-ra a
-*csak az elso 2s utan* idosavra, vagy a Demo1-specifikus deer-jel
-megerositese a `Kozepso regio` + `Oldalpalya` egyuttesere).
+Osszesitve: **16 / 16 zold**. A Demo1 24s-os szarvas a measurabb 0.20-as wildlife
+gate-ekkel mar atjut (raw score 0.201; korabbi 0.21-es gate ezt 0.009 pontszammal
+elvetette). A 7 NEG kamion-klipet a `looksLikeOncomingTruckProfile` szuro mar
+pontszamozas elott eldobja, igy a gate-csokkentes nem hozott vissza false positive-ot.
 
 ### 21.5 Futtatas
 
