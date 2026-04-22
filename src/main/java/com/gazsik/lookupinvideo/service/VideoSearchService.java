@@ -56,6 +56,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -119,6 +120,23 @@ public class VideoSearchService {
     private static final double OVERTRACKED_FLOW_RESIDUAL_MIN = 0.030;
     private static final List<String> VIDEO_EXTENSIONS =
             List.of(".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg");
+
+    /**
+     * Process-wide kill switch for the GPU phase-correlation path.
+     *
+     * <p>JavaCV's bundled OpenCV binary does not expose {@code phaseCorrelate(UMat, UMat)} on
+     * every platform/version — when unsupported the native call throws
+     * {@link UnsupportedOperationException}. Without this kill switch, the failure would happen
+     * on every single sampled frame across every grabber thread (10k+ exceptions per second
+     * with the current parallelism), which manifests as native off-heap memory pressure and
+     * a SIGKILL (exit 137) by the OS.
+     *
+     * <p>Initial value {@code true} = "try the GPU path"; flipped to {@code false} permanently
+     * the first time {@link #estimateGlobalShiftPhaseCorrelate} throws.
+     */
+    private static final AtomicBoolean PHASE_CORRELATE_GPU_AVAILABLE = new AtomicBoolean(true);
+    /** Set to true after we have probed phaseCorrelate at least once (or attempted to). */
+    private static final AtomicBoolean PHASE_CORRELATE_PROBED = new AtomicBoolean(false);
 
     private final Path storagePath;
     private final Map<String, Path> videoRegistry = new ConcurrentHashMap<>();
@@ -341,10 +359,11 @@ public class VideoSearchService {
                 .handle((outcome, ex) -> {
                     String fileName = videoPath.getFileName().toString();
                     if (ex != null) {
-                        LOG.warn("Directory file analysis timeout/failure for file={} (timeout={}s): {}",
-                                fileName,
-                                fileTimeoutSeconds,
-                                ex.toString());
+                        // Log full stack trace — we cannot diagnose UnsupportedOperationException
+                        // and similar native failures from a one-line ex.toString() summary.
+                        Throwable rootCause = unwrapCause(ex);
+                        LOG.warn("Directory file analysis timeout/failure for file={} (timeout={}s)",
+                                fileName, fileTimeoutSeconds, rootCause);
                         progress.fileCompleted(fileName, 0);
                         return null;
                     }
@@ -436,8 +455,11 @@ public class VideoSearchService {
                 } catch (TimeoutException timeoutException) {
                     future.cancel(true);
                     LOG.warn("Segment timeout during analyzeVideo; canceled one segment for file={}", fileName);
-                } catch (Exception ignored) {
-                    // Segment failure is non-fatal; continue with other segments.
+                } catch (Exception ex) {
+                    // Segment failure is non-fatal but we still want the stack trace, otherwise we
+                    // cannot diagnose recurring native errors (e.g. UnsupportedOperationException
+                    // from UMat operations on JavaCV builds that lack a given OpenCV symbol).
+                    LOG.warn("Segment failure during analyzeVideo for file={}", fileName, unwrapCause(ex));
                 }
             }
             for (CompletableFuture<List<SceneMatch>> future : futures) {
@@ -892,6 +914,11 @@ public class VideoSearchService {
             grabber.stop();
         } catch (Exception ex) {
             // Segment failure is non-fatal; return whatever matches were accumulated.
+            // Log the root cause once per segment so recurring native errors (e.g.
+            // UnsupportedOperationException from UMat ops) become visible instead of being
+            // silently swallowed. This single line is how we'll diagnose 137-class crashes.
+            LOG.warn("Segment processing aborted (segIdx={}, file={}): {}",
+                    segmentIndex, fileName, ex.toString(), ex);
         } finally {
             try { grabber.close(); } catch (Exception ignored) {}
         }
@@ -1163,6 +1190,18 @@ public class VideoSearchService {
         return Math.max(min, Math.min(max, value));
     }
 
+    /** Unwrap CompletionException / ExecutionException / InvocationTargetException wrappers. */
+    private static Throwable unwrapCause(Throwable t) {
+        Throwable cur = t;
+        while (cur != null && cur.getCause() != null
+                && (cur instanceof java.util.concurrent.CompletionException
+                    || cur instanceof java.util.concurrent.ExecutionException
+                    || cur instanceof java.lang.reflect.InvocationTargetException)) {
+            cur = cur.getCause();
+        }
+        return cur == null ? t : cur;
+    }
+
     /** Largest pairwise centroid span (in normalized image coords) inside a sliding window. */
     private static double computeMaxCentroidSpan(List<TrackPoint> track) {
         if (track == null || track.size() < 2) {
@@ -1372,9 +1411,19 @@ public class VideoSearchService {
             // GPU path: phaseCorrelate runs 2 forward DFTs + 1 inverse DFT on UMat — sustained,
             // genuinely heavy GPU work that replaces the 17x13 = 221-iteration CPU brute-force loop.
             // Falls back transparently to the CPU brute-force if any OpenCL/UMat call throws.
-            GlobalShift shift = preferGpu
-                    ? estimateGlobalShiftPhaseCorrelate(previousShared, currentShared, width, height)
-                    : estimateGlobalShiftOpenCl(previousShared, currentShared, width, height);
+            // PHASE_CORRELATE_GPU_AVAILABLE is a process-wide kill switch — once the GPU path has
+            // failed (typically because JavaCV's OpenCV build doesn't expose phaseCorrelate on
+            // UMat), every subsequent frame goes straight to brute force, avoiding the
+            // throw-on-every-frame storm that would otherwise SIGKILL the JVM.
+            GlobalShift shift;
+            if (preferGpu && PHASE_CORRELATE_GPU_AVAILABLE.get()) {
+                shift = estimateGlobalShiftPhaseCorrelate(previousShared, currentShared, width, height);
+                if (shift == null) {
+                    shift = estimateGlobalShiftOpenCl(previousShared, currentShared, width, height);
+                }
+            } else {
+                shift = estimateGlobalShiftOpenCl(previousShared, currentShared, width, height);
+            }
             double intensity = rgbDiffMean01(previousShared, currentShared, preferGpu);
 
             // Lateral sweep: left edge vs right edge asymmetry — direct camera-pan signal,
@@ -1600,23 +1649,32 @@ public class VideoSearchService {
      * The returned (dx, dy) is rounded to int and clamped to the same search window the legacy
      * brute-force estimator uses, so downstream code paths see identical semantics.
      *
-     * <p>If anything in the OpenCL stack throws (driver bug, unsupported size, etc.), the caller
-     * falls back to the CPU brute-force estimator via the surrounding try/catch in
-     * {@link #computeMotionMetricsWithBackend}.
+     * <p>Returns {@code null} (and permanently flips {@link #PHASE_CORRELATE_GPU_AVAILABLE} to
+     * {@code false}) if the underlying OpenCV build does not support phaseCorrelate on UMat —
+     * the caller must then fall through to the CPU estimator. This avoids the per-frame
+     * exception storm that would otherwise destabilize the JVM.
      */
     private static GlobalShift estimateGlobalShiftPhaseCorrelate(Mat previous,
                                                                  Mat current,
                                                                  int width,
                                                                  int height) {
+        if (!PHASE_CORRELATE_GPU_AVAILABLE.get()) {
+            return null;
+        }
         UMat uPrev = new UMat();
         UMat uCurr = new UMat();
         UMat uPrevGray = new UMat();
         UMat uCurrGray = new UMat();
         UMat uPrevF = new UMat();
         UMat uCurrF = new UMat();
+        Point2d shift = null;
+        // ROI views (Mat-of-Mat) routinely throw UnsupportedOperationException on copyTo(UMat)
+        // in JavaCV; cloning to a contiguous Mat first is the standard mitigation.
+        Mat prevSafe = ensureContiguous(previous);
+        Mat currSafe = ensureContiguous(current);
         try {
-            previous.copyTo(uPrev);
-            current.copyTo(uCurr);
+            prevSafe.copyTo(uPrev);
+            currSafe.copyTo(uCurr);
             cvtColor(uPrev, uPrevGray, COLOR_BGR2GRAY);
             cvtColor(uCurr, uCurrGray, COLOR_BGR2GRAY);
             uPrevGray.convertTo(uPrevF, CV_32F);
@@ -1625,20 +1683,38 @@ public class VideoSearchService {
             // phaseCorrelate(src1, src2) returns the (x, y) translation that takes src1 -> src2.
             // Same sign convention as the brute-force estimator: positive dx means curr is
             // shifted to the right relative to prev (camera panned left, content moved right).
-            Point2d shift = phaseCorrelate(uPrevF, uCurrF);
+            shift = phaseCorrelate(uPrevF, uCurrF);
             int dx = (int) Math.round(shift.x());
             int dy = (int) Math.round(shift.y());
             dx = Math.max(-GLOBAL_SHIFT_MAX_DX, Math.min(GLOBAL_SHIFT_MAX_DX, dx));
             dy = Math.max(-GLOBAL_SHIFT_MAX_DY, Math.min(GLOBAL_SHIFT_MAX_DY, dy));
-            shift.deallocate();
+            if (PHASE_CORRELATE_PROBED.compareAndSet(false, true)) {
+                LOG.info("Phase-correlation GPU path is AVAILABLE — using UMat phaseCorrelate for global shift estimation.");
+            }
             return new GlobalShift(dx, dy);
+        } catch (Throwable failure) {
+            // Permanently disable the GPU path — typically JavaCV's bundled OpenCV doesn't
+            // expose phaseCorrelate on UMat and throws UnsupportedOperationException. Without
+            // this kill switch every frame across every grabber thread would re-throw, causing
+            // off-heap memory pressure and SIGKILL (exit 137).
+            if (PHASE_CORRELATE_GPU_AVAILABLE.compareAndSet(true, false)) {
+                LOG.warn("Phase-correlation GPU path UNAVAILABLE ({}: {}) — permanently falling back to CPU brute-force shift estimator for the rest of this process.",
+                        failure.getClass().getSimpleName(),
+                        failure.getMessage());
+            }
+            return null;
         } finally {
+            if (shift != null) {
+                try { shift.deallocate(); } catch (Throwable ignored) {}
+            }
             uPrevF.release();
             uCurrF.release();
             uPrevGray.release();
             uCurrGray.release();
             uPrev.release();
             uCurr.release();
+            if (prevSafe != previous) prevSafe.release();
+            if (currSafe != current) currSafe.release();
         }
     }
 
@@ -1707,22 +1783,53 @@ public class VideoSearchService {
         return diffMean.get(0);
     }
 
+    /**
+     * Per-helper kill switches for GPU-backed paths that can throw
+     * {@link UnsupportedOperationException} on JavaCV builds whose underlying OpenCV binary does
+     * not support the operation on UMat. Without these switches every per-frame failure would
+     * re-throw across all grabber threads, churning native memory until the OS kills the JVM
+     * (exit 137).
+     */
+    private static final AtomicBoolean MEAN_ABS_DIFF_GPU = new AtomicBoolean(true);
+    private static final AtomicBoolean ABS_DIFF_GPU = new AtomicBoolean(true);
+    private static final AtomicBoolean BINARY_MASK_GPU = new AtomicBoolean(true);
+
+    /** Ensure the input Mat is contiguous before uploading to UMat — ROI views can throw on copyTo(UMat). */
+    private static Mat ensureContiguous(Mat src) {
+        if (src == null || src.empty()) {
+            return src;
+        }
+        if (src.isContinuous()) {
+            return src;
+        }
+        Mat clone = new Mat();
+        src.copyTo(clone);
+        return clone;
+    }
+
     private static Scalar meanAbsDiff(Mat a, Mat b, boolean preferGpu) {
-        if (preferGpu) {
+        if (preferGpu && MEAN_ABS_DIFF_GPU.get()) {
+            UMat ua = new UMat();
+            UMat ub = new UMat();
+            UMat ud = new UMat();
+            Mat aSafe = ensureContiguous(a);
+            Mat bSafe = ensureContiguous(b);
             try {
-                UMat ua = new UMat();
-                UMat ub = new UMat();
-                UMat ud = new UMat();
-                a.copyTo(ua);
-                b.copyTo(ub);
+                aSafe.copyTo(ua);
+                bSafe.copyTo(ub);
                 absdiff(ua, ub, ud);
-                Scalar s = mean(ud);
+                return mean(ud);
+            } catch (Throwable failure) {
+                if (MEAN_ABS_DIFF_GPU.compareAndSet(true, false)) {
+                    LOG.warn("meanAbsDiff GPU path UNAVAILABLE ({}: {}) — permanently falling back to CPU.",
+                            failure.getClass().getSimpleName(), failure.getMessage());
+                }
+            } finally {
                 ua.release();
                 ub.release();
                 ud.release();
-                return s;
-            } catch (Throwable ignored) {
-                // Fall through to CPU path.
+                if (aSafe != a) aSafe.release();
+                if (bSafe != b) bSafe.release();
             }
         }
         Mat diff = new Mat();
@@ -1733,22 +1840,30 @@ public class VideoSearchService {
     }
 
     private static Mat absDiffWithOptionalGpu(Mat a, Mat b, boolean preferGpu) {
-        if (preferGpu) {
+        if (preferGpu && ABS_DIFF_GPU.get()) {
+            UMat ua = new UMat();
+            UMat ub = new UMat();
+            UMat ud = new UMat();
+            Mat aSafe = ensureContiguous(a);
+            Mat bSafe = ensureContiguous(b);
             try {
-                UMat ua = new UMat();
-                UMat ub = new UMat();
-                UMat ud = new UMat();
-                a.copyTo(ua);
-                b.copyTo(ub);
+                aSafe.copyTo(ua);
+                bSafe.copyTo(ub);
                 absdiff(ua, ub, ud);
                 Mat out = new Mat();
                 ud.copyTo(out);
+                return out;
+            } catch (Throwable failure) {
+                if (ABS_DIFF_GPU.compareAndSet(true, false)) {
+                    LOG.warn("absDiff GPU path UNAVAILABLE ({}: {}) — permanently falling back to CPU.",
+                            failure.getClass().getSimpleName(), failure.getMessage());
+                }
+            } finally {
                 ua.release();
                 ub.release();
                 ud.release();
-                return out;
-            } catch (Throwable ignored) {
-                // Fall through to CPU path.
+                if (aSafe != a) aSafe.release();
+                if (bSafe != b) bSafe.release();
             }
         }
         Mat out = new Mat();
@@ -1760,24 +1875,31 @@ public class VideoSearchService {
                                                            Mat residualGray,
                                                            Mat activeMask,
                                                            boolean preferGpu) {
-        if (!preferGpu) {
+        if (!preferGpu || !BINARY_MASK_GPU.get()) {
             return false;
         }
+        UMat uResidual = new UMat();
+        UMat uGray = new UMat();
+        UMat uMask = new UMat();
+        Mat residualSafe = ensureContiguous(residualDiff);
         try {
-            UMat uResidual = new UMat();
-            UMat uGray = new UMat();
-            UMat uMask = new UMat();
-            residualDiff.copyTo(uResidual);
+            residualSafe.copyTo(uResidual);
             cvtColor(uResidual, uGray, COLOR_BGR2GRAY);
             threshold(uGray, uMask, 0.11 * 255.0, 255.0, THRESH_BINARY);
             uGray.copyTo(residualGray);
             uMask.copyTo(activeMask);
+            return true;
+        } catch (Throwable failure) {
+            if (BINARY_MASK_GPU.compareAndSet(true, false)) {
+                LOG.warn("buildBinaryMask GPU path UNAVAILABLE ({}: {}) — permanently falling back to CPU.",
+                        failure.getClass().getSimpleName(), failure.getMessage());
+            }
+            return false;
+        } finally {
             uMask.release();
             uGray.release();
             uResidual.release();
-            return true;
-        } catch (Throwable ignored) {
-            return false;
+            if (residualSafe != residualDiff) residualSafe.release();
         }
     }
 

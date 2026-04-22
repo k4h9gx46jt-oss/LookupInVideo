@@ -10,3 +10,7 @@ uploads/*
 *.mp4
 *.jpg
 *.jpeg
+
+# Local run logs (build/run/gc + heap dumps)
+logs/
+*.hprof
