@@ -13,15 +13,44 @@ public class EventPostProcessor {
 
     private static final int MAX_MATCHES = 12;
     private static final double WILDLIFE_CLUSTER_WINDOW_SECONDS = 2.6;
+    /** Smaller dedup window for vehicle / event-style intents (avoid spamming a single moving object). */
+    private static final double EVENT_CLUSTER_WINDOW_SECONDS = 1.4;
+    private static final double EVENT_MIN_GAP_SECONDS = 0.7;
 
     public List<SceneMatch> postProcess(QueryIntent intent, List<SceneMatch> candidates) {
         if (candidates == null || candidates.isEmpty()) {
             return List.of();
         }
-        if (intent != QueryIntent.WILDLIFE) {
-            return new ArrayList<>(candidates);
+        if (intent == QueryIntent.WILDLIFE) {
+            return postProcessWildlifeMatches(candidates);
         }
-        return postProcessWildlifeMatches(candidates);
+        if (intent == QueryIntent.LANE_CHANGE
+                || intent == QueryIntent.CROSSING_VEHICLE
+                || intent == QueryIntent.ROAD_OBSTACLE
+                || intent == QueryIntent.ANOMALY
+                || intent == QueryIntent.TURN) {
+            return postProcessEventMatches(candidates);
+        }
+        return new ArrayList<>(candidates);
+    }
+
+    private List<SceneMatch> postProcessEventMatches(List<SceneMatch> candidates) {
+        List<SceneMatch> byTime = new ArrayList<>(candidates);
+        byTime.sort(Comparator.comparingDouble(SceneMatch::getTimestampSeconds));
+        List<SceneMatch> representatives = selectTemporalRepresentatives(byTime, EVENT_CLUSTER_WINDOW_SECONDS);
+        representatives.sort(Comparator.comparingDouble(SceneMatch::getConfidence).reversed());
+
+        List<SceneMatch> filtered = new ArrayList<>();
+        for (SceneMatch candidate : representatives) {
+            if (isTooCloseInTime(filtered, candidate, EVENT_MIN_GAP_SECONDS)) {
+                continue;
+            }
+            filtered.add(candidate);
+            if (filtered.size() >= MAX_MATCHES) {
+                break;
+            }
+        }
+        return filtered;
     }
 
     private List<SceneMatch> postProcessWildlifeMatches(List<SceneMatch> candidates) {

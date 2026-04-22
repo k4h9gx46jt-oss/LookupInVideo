@@ -13,6 +13,14 @@ public class EventScoringService {
             case WILDLIFE -> score >= 0.21;
             // TURN: lateralSweepScore * motionGate (0=szimmetrikus/egyenes, 1=teljesen aszimmetrikus/kanyar)
             case TURN -> score >= 0.30;
+            // LANE_CHANGE: koherens horizontalis kameraeltolas, alacsony residual + nem teljes kanyar
+            case LANE_CHANGE -> score >= 0.28;
+            // CROSSING_VEHICLE: keresztiranyu mozgas + centroid attranszlal a kepen
+            case CROSSING_VEHICLE -> score >= 0.30;
+            // ROAD_OBSTACLE: ego-megallas / akadaly elotti elgyengulo mozgas
+            case ROAD_OBSTACLE -> score >= 0.32;
+            // ANOMALY: burst-szeru, hirtelen-mozgasos esemeny
+            case ANOMALY -> score >= 0.34;
             default -> score >= 0.18;
         };
     }
@@ -35,10 +43,10 @@ public class EventScoringService {
             case COLOR -> "A piros/red, zold/green es kek/blue kulcsszavak szinalapu keresest hasznalnak, mozgas-boosttal a hirtelen kepen athuzo targyakhoz.";
             case WILDLIFE -> "A szarvas/deer/vad kulcsszavaknal a keresztiranyu mozgas dominans, az oncoming vehicle jellegu mintakat szurjuk.";
             case TURN -> "Ket fuggetlen jel kombinacioja: (1) kepszel-aszimmetria (lateralSweep) — nagy kanyarnal is mukodik, nem telitodik; (2) horizontalis shift + koherencia — kis/kozepes kanyarhoz. A ket jel maximuma * mozgaskapu adja a vegs\u0151 pontszamot.";
-            case LANE_CHANGE -> "A savvaltas intent jelenleg a mozgasalapu baseline-ra fallbackel, a geometriara epulo lane-modell kesobb jon.";
-            case CROSSING_VEHICLE -> "A keresztbe meno jarmu intent jelenleg a mozgasalapu baseline-ra fallbackel, dedikalt tracker alapu esemenylogika kesobb jon.";
-            case ANOMALY -> "Az anomalia intent jelenleg a mozgasalapu baseline-ra fallbackel; candidate + verifier ketlepcsos logika kesobb jon.";
-            case ROAD_OBSTACLE -> "Az utakadaly intent jelenleg a mozgasalapu baseline-ra fallbackel; objektumdetektor integracio kesobb jon.";
+            case LANE_CHANGE -> "Savvaltas: az aláírt globalShiftX EMA koherenciaja (~2 s ablakon) jelzi az ego ater\u00e9st, miközben a kanyar-szimmetria es a keresztmozgas alacsony marad. Score = coherence * motionGate * (1 - sweep) * (1 - crossMotionRatio).";
+            case CROSSING_VEHICLE -> "Keresztbe meno jarmu: crossMotionRatio * travelScore * residualGate * crossTravelGate, plusz centroid-elmozdulas legalabb ~0.10 kepszelesseg ~1.2 s alatt — szarvas-szuro nelkul, igy autoszinek is mehetnek.";
+            case ANOMALY -> "Anomalia: burstScore (residualIntensity-EMA elteres) gate-elve max(crossMotionRatio, lateralSweepScore)-szal — minimalis residualIntensity korlattal a zaj ellen.";
+            case ROAD_OBSTACLE -> "Utakadaly / megallas: hosszu intensity-EMA es shiftMag-EMA letorese (drop ratio) + alacsony abszolut intensity. Score = stopDrop * stopGate.";
             case MOTION -> "A megadott szoveget fogadjuk, de objektumfelismeres helyett jelenleg mozgas-intenzitas alapjan rangsorolunk.";
         };
     }

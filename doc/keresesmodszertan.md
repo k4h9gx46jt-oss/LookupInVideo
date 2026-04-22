@@ -180,9 +180,10 @@ Ha nincs property megadva:
 
 ### 4.4 Megjegyzés a fallback modokról
 
-A `LANE_CHANGE`, `TURN`, `CROSSING_VEHICLE`, `ANOMALY`, `ROAD_OBSTACLE` intents jelenleg
-a mozgásintenzitás-alapú baseline-ra (`MOTION` logika) esnek vissza — dedikált eseménydetektoruk
-még nincs implementálva. A `WILDLIFE` és `COLOR` modok rendelkeznek valódi, célzott pipeline-nal.
+A `WILDLIFE`, `COLOR`, `TURN`, `LANE_CHANGE`, `CROSSING_VEHICLE`, `ROAD_OBSTACLE` és `ANOMALY`
+intentekhez **mindegyikhez** dedikált, matematikai jellel meghajtott pontszámfüggvény tartozik
+(részletek a 7.6 szakaszban). A `MOTION` továbbra is a fallback (általános mozgás-intenzitás)
+azoknak a szabadszöveges lekérdezéseknek, amelyek egyik kulcsszó-csoportba sem esnek.
 
 ## 5. Fo konstansok (algoritmus parameterek)
 
@@ -235,11 +236,15 @@ Input:
 Lepesek:
 1. query normalizalas + mod valasztas (`resolveMode`, `resolveColorQuery`).
 2. video hossza: `probeVideoDuration(videoPath)`.
-3. mintavetel: `sampleStepForMode(mode, durationUs)`:
-   - nem deer: `1_000_000 us`
-   - deer + duration >= 360 s: `350_000 us`
-   - deer + duration >= 180 s: `250_000 us`
-   - deer + rovidebb: `150_000 us`
+3. mintavetel: `FrameSampler.computeSampleStepUs(intent, durationUs)`:
+   - `TURN`, `LANE_CHANGE`: `500_000 us`
+   - `CROSSING_VEHICLE`: `250_000 us`
+   - `ANOMALY`: `350_000 us`
+   - `ROAD_OBSTACLE`: `500_000 us`
+   - `WILDLIFE` + duration >= 360 s: `350_000 us`
+   - `WILDLIFE` + duration >= 180 s: `250_000 us`
+   - `WILDLIFE` + rovidebb: `150_000 us`
+   - egyebkent (`COLOR`, `MOTION`): `1_000_000 us`
 4. analizis szelesseg:
    - GPU/OpenCL aktiv: `512`
    - kulonben CPU: `320`
@@ -342,11 +347,63 @@ Pontszam:
 - `score = motionMetrics.intensity`
 - reason: mozgas-intenzitas (%)
 
+#### LANE_CHANGE mod (savvaltas)
+- per-frame state: `signedShiftXEma = 0.80*prev + 0.20*globalShiftX` (~2 s ablak)
+- `coherence = clamp(|signedShiftXEma| / 2.5, 0..1)` — koherens horizontalis ego-eltolas
+- `motionGate = clamp(intensity / 0.04, 0..1)` — auto haladjon
+- `notATurn = clamp(1 - lateralSweepScore / 0.55, 0..1)` — ne legyen teljes kanyar
+- `notACrossing = clamp(1 - crossMotionRatio / 0.55, 0..1)` — ne legyen kereszt-jarmu
+- `cleanScene = clamp(1 - residualIntensity / 0.060, 0..1)` — ne legyen idegen targy
+- `score = coherence * motionGate * notATurn * sqrt(notACrossing * cleanScene)`
+- reason: `Savvaltas: X% [<- balra | -> jobbra] | shiftCoh, intenz, sweep, cross`
+
+#### CROSSING_VEHICLE mod (keresztezo jarmu)
+- per-frame state: `crossingTrack` — ~1.2 s csuszoablak a centroidokkal
+- `crossRatioGate = clamp((crossMotionRatio - 0.40) / 0.40, 0..1)`
+- `crossTravelGate = clamp((crossTravel - 0.012) / 0.040, 0..1)`
+- `residualGate = clamp((residualIntensity - 0.020) / 0.060, 0..1)`
+- `speedGate = clamp(travelScore / 0.45, 0..1)`
+- `translation = max centroid bbox span` (utolso ~1.2 s)
+- `translationGate = clamp((translation - 0.08) / 0.18, 0..1)`
+- `score = crossRatioGate * sqrt(crossTravelGate * speedGate) * residualGate * (0.35 + 0.65 * translationGate)`
+- reason: `Keresztezo jarmu: X% | crossRatio, crossTravel, travel, transl`
+
+#### ROAD_OBSTACLE mod (megallas / akadaly)
+- per-frame state: `intensityLongEma`, `shiftMagLongEma` (~3 s, alpha=0.10)
+- (A) hirtelen megallas:
+  - `dropRatio = clamp((intensityLongEma - intensity) / max(intensityLongEma, 0.005), 0..1)`
+  - `shiftDropRatio = clamp((shiftMagLongEma - shiftMagNow) / shiftMagLongEma, 0..1)`
+  - `wasMovingGate = clamp((intensityLongEma - 0.020) / 0.040, 0..1)`
+  - `nowQuietGate = clamp((0.018 - intensity) / 0.018, 0..1)`
+  - `stopScore = wasMovingGate * nowQuietGate * (0.55 * dropRatio + 0.45 * shiftDropRatio)`
+- (B) lingering kozepso akadaly:
+  - `centerObstacle = clamp((centerRatio - 0.30) / 0.40) * clamp((0.025 - residualIntensity) / 0.025) * clamp((0.025 - intensity) / 0.025)`
+- `score = max(stopScore, 0.85 * centerObstacle)`
+- reason: `Megallas/akadaly: X% | stopScore, intDrop, shiftDrop, intEma`
+
+#### ANOMALY mod (rendellenes / hirtelen mozgas)
+- `burstGate = clamp((burstScore - 0.025) / 0.060, 0..1)` — burst = `residualIntensity - motionEma`
+- `residualGate = clamp((residualIntensity - 0.030) / 0.060, 0..1)`
+- `sideSignal = max(crossMotionRatio, lateralSweepScore)`
+- `sideGate = clamp((sideSignal - 0.30) / 0.45, 0..1)`
+- `activeBoost = clamp((activeRatio - 0.020) / 0.060, 0..1)`
+- `score = burstGate * residualGate * (0.50 + 0.50 * sideGate) * (0.65 + 0.35 * activeBoost)`
+- reason: `Anomalia: X% | burst, residual, sideMax, active`
+
 ### 7.7 Match kapu
-`isMatch(mode, score)`:
+`isMatch(intent, score)`:
 - COLOR: `score >= 0.14`
-- DEER: `score >= 0.21`
-- MOTION: `score >= 0.18`
+- WILDLIFE: `score >= 0.21`
+- TURN: `score >= 0.30`
+- LANE_CHANGE: `score >= 0.28`
+- CROSSING_VEHICLE: `score >= 0.30`
+- ROAD_OBSTACLE: `score >= 0.32`
+- ANOMALY: `score >= 0.34`
+- MOTION (fallback): `score >= 0.18`
+
+A `LANE_CHANGE`, `CROSSING_VEHICLE`, `ROAD_OBSTACLE`, `ANOMALY` es `TURN` modok
+post-processzben temporalis dedup-ot kapnak (1.4 s cluster ablak, 0.7 s min. gap),
+hogy ne kapjon a felhasznalo egy esemenyrol 5-6 talalatot egymas mellett.
 
 Ha atment:
 - preview keszites: `createPreviewDataUrl(...)` (260 px szeles JPEG)

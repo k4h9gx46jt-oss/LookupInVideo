@@ -14,6 +14,18 @@ public class FrameSampler {
             // Finer sampling to catch short turns and lane changes
             return 500_000L;
         }
+        if (intent == QueryIntent.CROSSING_VEHICLE) {
+            // Fast lateral motion across the frame – needs sub-second sampling
+            return 250_000L;
+        }
+        if (intent == QueryIntent.ANOMALY) {
+            // Burst events are short – sample ~3 fps
+            return 350_000L;
+        }
+        if (intent == QueryIntent.ROAD_OBSTACLE) {
+            // Stop / stationary detection compares against a longer EMA, 0.5 s is enough
+            return 500_000L;
+        }
         if (intent != QueryIntent.WILDLIFE) {
             return DEFAULT_SAMPLE_STEP_US;
         }

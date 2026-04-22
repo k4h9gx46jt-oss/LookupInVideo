@@ -505,6 +505,15 @@ public class VideoSearchService {
             double motionEma = 0.0;
             double previousActiveRatio = Double.NaN;
             List<TrackPoint> deerTrack = new ArrayList<>();
+            // Lightweight per-segment state for the new event detectors.
+            // signedShiftXEma:  EMA of signed globalShiftX – coherent direction = ego lane drift
+            // intensityLongEma: long-window EMA (~3 s) of intensity – baseline for stop detection
+            // shiftMagLongEma:  long-window EMA of |globalShift| – baseline for stop detection
+            // crossingTrack:    ~1.2 s sliding centroid window for crossing-vehicle translation gate
+            double signedShiftXEma = 0.0;
+            double intensityLongEma = Double.NaN;
+            double shiftMagLongEma = Double.NaN;
+            List<TrackPoint> crossingTrack = new ArrayList<>();
             long nextSampleUs = warmupStartUs;
 
             Frame frame;
@@ -602,6 +611,28 @@ public class VideoSearchService {
                             ? 0.0
                             : Math.max(0.0, motionMetrics.activeRatio - previousActiveRatio);
                     previousActiveRatio = motionMetrics.activeRatio;
+
+                    // ----- Per-frame state for the new event detectors (cheap, always updated) -----
+                    // signedShiftXEma: low-pass on signed horizontal camera shift (~2 s window).
+                    signedShiftXEma = signedShiftXEma * 0.80 + motionMetrics.globalShiftX * 0.20;
+                    // Long-window EMAs for stop / obstacle detection (~3 s, alpha = 0.10).
+                    double shiftMagNow = Math.hypot(motionMetrics.globalShiftX, motionMetrics.globalShiftY);
+                    intensityLongEma = Double.isNaN(intensityLongEma)
+                            ? motionMetrics.intensity
+                            : intensityLongEma * 0.90 + motionMetrics.intensity * 0.10;
+                    shiftMagLongEma = Double.isNaN(shiftMagLongEma)
+                            ? shiftMagNow
+                            : shiftMagLongEma * 0.90 + shiftMagNow * 0.10;
+                    // Crossing track: ~1.2 s sliding centroid window for CROSSING_VEHICLE translation gate.
+                    double tNowSeconds = timestampUs / 1_000_000.0;
+                    if (intent == QueryIntent.CROSSING_VEHICLE
+                            && motionMetrics.activeRatio >= 0.005
+                            && motionMetrics.residualIntensity >= 0.012) {
+                        crossingTrack.add(new TrackPoint(tNowSeconds, motionMetrics.centroidX, motionMetrics.centroidY));
+                        while (!crossingTrack.isEmpty() && tNowSeconds - crossingTrack.get(0).timestampSeconds > 1.2) {
+                            crossingTrack.remove(0);
+                        }
+                    }
 
                     double axisNormNow = Math.hypot(longitudinalAxisX, longitudinalAxisY);
                     double axisXNow = axisNormNow < 1e-6 ? 0.0 : longitudinalAxisX / axisNormNow;
@@ -731,6 +762,93 @@ public class VideoSearchService {
                                 score * 100, turnDir,
                                 sweepSig * 100, shiftCoh * 100,
                                 motionMetrics.intensity * 100);
+                    } else if (intent == QueryIntent.LANE_CHANGE) {
+                        // === LANE_CHANGE detector ===
+                        // Ego lane drift = sustained, signed horizontal camera shift while moving forward,
+                        // WITHOUT a full turn (low lateralSweep) and WITHOUT a foreground crossing object
+                        // (low crossMotionRatio + low residualIntensity).
+                        double motionGate = clamp(motionMetrics.intensity / 0.04, 0.0, 1.0);
+                        double coherence = clamp(Math.abs(signedShiftXEma) / 2.5, 0.0, 1.0);
+                        double notATurn = clamp(1.0 - motionMetrics.lateralSweepScore / 0.55, 0.0, 1.0);
+                        double notACrossing = clamp(1.0 - motionMetrics.crossMotionRatio / 0.55, 0.0, 1.0);
+                        double cleanScene = clamp(1.0 - motionMetrics.residualIntensity / 0.060, 0.0, 1.0);
+                        score = coherence * motionGate * notATurn * Math.sqrt(notACrossing * cleanScene);
+                        String dir = signedShiftXEma > 0.4 ? "<- balra"
+                                : signedShiftXEma < -0.4 ? "-> jobbra"
+                                : "ismeretlen";
+                        reason = String.format(Locale.ROOT,
+                                "Savvaltas: %.1f%% [%s] | shiftCoh=%.1f%% intenz=%.1f%% sweep=%.1f%% cross=%.1f%%",
+                                score * 100, dir,
+                                coherence * 100, motionGate * 100,
+                                motionMetrics.lateralSweepScore * 100,
+                                motionMetrics.crossMotionRatio * 100);
+                    } else if (intent == QueryIntent.CROSSING_VEHICLE) {
+                        // === CROSSING_VEHICLE detector ===
+                        // Like wildlife crossing but vehicle colors allowed. Requires:
+                        //   - high crossMotionRatio (foreground motion is sideways)
+                        //   - meaningful crossTravel & travelScore (centroid actually moves)
+                        //   - residualIntensity above noise
+                        //   - centroid translated >= ~0.10 of frame width within ~1.2 s
+                        double crossRatioGate = clamp((motionMetrics.crossMotionRatio - 0.40) / 0.40, 0.0, 1.0);
+                        double crossTravelGate = clamp((motionMetrics.crossTravel - 0.012) / 0.040, 0.0, 1.0);
+                        double residualGate = clamp((motionMetrics.residualIntensity - 0.020) / 0.060, 0.0, 1.0);
+                        double speedGate = clamp(motionMetrics.travelScore / 0.45, 0.0, 1.0);
+                        double translation = computeMaxCentroidSpan(crossingTrack);
+                        double translationGate = clamp((translation - 0.08) / 0.18, 0.0, 1.0);
+                        score = crossRatioGate
+                                * Math.sqrt(crossTravelGate * speedGate)
+                                * residualGate
+                                * (0.35 + 0.65 * translationGate);
+                        reason = String.format(Locale.ROOT,
+                                "Keresztezo jarmu: %.1f%% | crossRatio=%.1f%% crossTravel=%.1f%% travel=%.1f%% transl=%.1f%%",
+                                score * 100,
+                                motionMetrics.crossMotionRatio * 100,
+                                motionMetrics.crossTravel * 100,
+                                motionMetrics.travelScore * 100,
+                                translation * 100);
+                    } else if (intent == QueryIntent.ROAD_OBSTACLE) {
+                        // === ROAD_OBSTACLE detector ===
+                        // Detect either:
+                        //   (A) sudden ego-stop: long-EMA intensity & shift were high, current values dropped sharply
+                        //   (B) lingering low-motion in front of camera (object blocking road)
+                        double prevLevel = Math.max(intensityLongEma, 0.005);
+                        double dropRatio = clamp((prevLevel - motionMetrics.intensity) / prevLevel, 0.0, 1.0);
+                        double shiftDropRatio = shiftMagLongEma <= 0.05
+                                ? 0.0
+                                : clamp((shiftMagLongEma - shiftMagNow) / shiftMagLongEma, 0.0, 1.0);
+                        double wasMovingGate = clamp((intensityLongEma - 0.020) / 0.040, 0.0, 1.0);
+                        double nowQuietGate = clamp((0.018 - motionMetrics.intensity) / 0.018, 0.0, 1.0);
+                        double stopScore = wasMovingGate * nowQuietGate * (0.55 * dropRatio + 0.45 * shiftDropRatio);
+
+                        double centerObstacle = clamp((motionMetrics.centerRatio - 0.30) / 0.40, 0.0, 1.0)
+                                * clamp((0.025 - motionMetrics.residualIntensity) / 0.025, 0.0, 1.0)
+                                * clamp((0.025 - motionMetrics.intensity) / 0.025, 0.0, 1.0);
+
+                        score = Math.max(stopScore, centerObstacle * 0.85);
+                        reason = String.format(Locale.ROOT,
+                                "Megallas/akadaly: %.1f%% | stopScore=%.1f%% intDrop=%.1f%% shiftDrop=%.1f%% intEma=%.1f%%",
+                                score * 100,
+                                stopScore * 100,
+                                dropRatio * 100,
+                                shiftDropRatio * 100,
+                                intensityLongEma * 100);
+                    } else if (intent == QueryIntent.ANOMALY) {
+                        // === ANOMALY detector ===
+                        // Combination of an unusual residual burst with either lateral image asymmetry
+                        // or strong cross-motion — i.e. "something happened that doesn't match steady drive".
+                        double burstGate = clamp((burstScore - 0.025) / 0.060, 0.0, 1.0);
+                        double residualGate = clamp((motionMetrics.residualIntensity - 0.030) / 0.060, 0.0, 1.0);
+                        double sideSignal = Math.max(motionMetrics.crossMotionRatio, motionMetrics.lateralSweepScore);
+                        double sideGate = clamp((sideSignal - 0.30) / 0.45, 0.0, 1.0);
+                        double activeBoost = clamp((motionMetrics.activeRatio - 0.020) / 0.060, 0.0, 1.0);
+                        score = burstGate * residualGate * (0.50 + 0.50 * sideGate) * (0.65 + 0.35 * activeBoost);
+                        reason = String.format(Locale.ROOT,
+                                "Anomalia: %.1f%% | burst=%.1f%% residual=%.1f%% sideMax=%.1f%% active=%.1f%%",
+                                score * 100,
+                                burstGate * 100,
+                                motionMetrics.residualIntensity * 100,
+                                sideSignal * 100,
+                                motionMetrics.activeRatio * 100);
                     } else {
                         score = motionMetrics.intensity;
                         reason = String.format(Locale.ROOT, "Mozgas-intenzitas: %.1f%%", motionMetrics.intensity * 100);
@@ -1040,6 +1158,26 @@ public class VideoSearchService {
 
     private static double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    /** Largest pairwise centroid span (in normalized image coords) inside a sliding window. */
+    private static double computeMaxCentroidSpan(List<TrackPoint> track) {
+        if (track == null || track.size() < 2) {
+            return 0.0;
+        }
+        double minX = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        for (TrackPoint p : track) {
+            if (p.centroidX < minX) minX = p.centroidX;
+            if (p.centroidX > maxX) maxX = p.centroidX;
+            if (p.centroidY < minY) minY = p.centroidY;
+            if (p.centroidY > maxY) maxY = p.centroidY;
+        }
+        double spanX = maxX - minX;
+        double spanY = maxY - minY;
+        return Math.hypot(spanX, spanY);
     }
 
     private static double computeDeerTimestampLeadSeconds(MotionMetrics motion,
