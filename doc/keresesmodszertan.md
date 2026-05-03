@@ -82,7 +82,7 @@ es csak `done()` allitja 100%-ra.
 
 ## 3. Konfiguracio es alap parameterek
 
-## 3.1 `application.properties` (jelenlegi repo ertekek)
+### 3.1 `application.properties` (jelenlegi repo ertekek)
 - `spring.servlet.multipart.max-file-size=4096MB`
 - `spring.servlet.multipart.max-request-size=4096MB`
 - `lookup.video.storage-path=uploads`
